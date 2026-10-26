@@ -1,0 +1,26 @@
+# The WebRTC media worker: its own Cargo workspace, deliberately NOT a member of rust/Cargo.toml.
+# The LiveKit SDK links libwebrtc (a large prebuilt C++ library that needs a recent clang to
+# build against), so the engine never depends on it: the worker joins the room, and talks to the
+# engine over the voip transport's media-stream WebSocket like any other media gateway.
+[workspace]
+resolver = "2"
+members = ["crates/sutra-webrtc-core", "crates/sutra-webrtc-worker"]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.96"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

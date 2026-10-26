@@ -1,0 +1,150 @@
+# Channels for the video-meeting-assistant module, 1.0.0 — the LIVE variant: real live
+# transcription sessions (OpenAI Realtime, transcription-only) and a real video-understanding model
+# (Gemini, native API). It differs from the stub variant only in the `meeting-transcription` and
+# `video-analysis` channels (the models). Export OPENAI_API_KEY and GEMINI_API_KEY before `up`.
+#
+#   sutra package examples/video-meeting-assistant/variants/video-live \
+#       --overlay examples/video-meeting-assistant/shared \
+#       --out examples/video-meeting-assistant/deploy/deployments
+#
+# THE SESSION. The WebRTC worker (tools/sutra-webrtc-worker) sits in the meeting room as a
+# visible participant and streams every other participant to the engine on ONE tagged socket of
+# the `voip` transport's media-stream protocol: each participant's own audio track and sampled
+# camera frames, with joins and leaves. The engine never touches WebRTC. The worker presents the
+# room as a call to the number below.
+#
+# THE MEDIA PLANE never reaches the flow: the transport records each participant's audio (sealed,
+# to the object store), transcribes each participant's track live (exact attribution: a segment
+# comes from one person's track), and analyses each segment of each ANALYSED participant with a
+# video-understanding model. The flow hears sparse events: the session started, someone joined
+# or left, one transcript segment, one segment analysis, the session ended.
+
+channels:
+  # ---- the session ------------------------------------------------------------------------------
+
+  # { callId, from, to, session: "meeting", mode: "listen", recorded, headers: {x-room} }
+  - name: session-start
+    transport: voip
+    bind: "number:+15550190000"       # SUTRA_WORKER_CALLED of the worker in this room
+    codec: json
+    mode: listen                      # nobody takes turns with a meeting
+    record: true                      # each participant's audio, sealed; the process audits media
+    silence-ms: 400                   # a pause this long ends a speaker's turn (a turn boundary)
+    dead-air-ms: 4000                 # nobody speaking this long is a flagged moment
+    # VIDEO SAMPLING — the cost dial. Frames of every participant at this rate, plus one frame of
+    # everyone at turn boundaries and audio-flagged moments (an interruption, raised energy, a
+    # long silence), so a listener's reaction is caught as well as the speaker's.
+    video:
+      fps: 1
+      max-width: 640
+      quality: 70
+      extra-frames: true
+
+  # { callId, event: joined|left, participantId, participantIndex, label, role, analysed,
+  #   analysisPolicy, atMs }
+  - name: call-participant
+    transport: voip
+    event: call-participant
+    codec: json
+
+  - name: call-hangup
+    transport: voip
+    event: call-hangup
+    codec: json
+
+  # One final transcript segment of ONE participant: { callId, seq, key, speaker (its label),
+  # speakerSource: "track", participantId, startMs, endMs, text, channel, provider, model,
+  # features } -> transcript-segment. Each participant's track gets its own live session, opened
+  # through the `meeting-transcription` llm channel below.
+  - name: call-transcript
+    transport: voip
+    event: call-transcript
+    codec: json
+    transcribe:
+      channel: meeting-transcription      # the llm channel each live session is opened through
+      language: en
+      drain-ms: 3000
+
+  # One participant over one segment: { callId, key, participantId, role, segment, startMs, endMs,
+  # speaking, talkMs, frames, audioMs, features, result: {expression, engagement, attention,
+  # bodyLanguage, emotion: {label, confidence, modalities}, disagreement, reactions}, status }
+  # -> segment-analysis. THE POLICY lives here and is enforced by the transport: only `roles` are
+  # analysed; a staff role is refused unless `allow-staff: true` (see the README — prohibited at
+  # work in the EU). A participant who is not analysed never has a frame sent to the model. The
+  # model is the `video-analysis` llm channel below.
+  - name: call-analysis
+    transport: voip
+    event: call-analysis
+    codec: json
+    analyze:
+      channel: video-analysis             # the llm channel each segment is analysed through
+      roles: [external]
+      allow-staff: false
+      default-role: unknown               # a participant admitted with no role is not analysed
+      segment-seconds: 5
+      when: post-call                     # or periodic: each segment as it closes
+      max-frames: 8
+
+  # ---- what the flow does to the session ---------------------------------------------------------
+
+  # Synchronous: { callId, prompt, consent: true } — the bot SAYS the announcement in the room
+  # (the worker publishes it as the bot's audio track); played to the end, it is what each
+  # recording's `consentAnnounced` reports.
+  - name: play
+    direction: outbound
+    transport: voip
+    bind: "voip://play"
+    ack-mode: on-complete
+
+  # Leave the room (the worker ends the session).
+  - name: hangup
+    direction: outbound
+    transport: voip
+    bind: "voip://hangup"
+
+  # ---- the models the transport calls ------------------------------------------------------------
+
+  # Called by the voip transport itself: the audio and the frames go from the transport to the
+  # provider and never pass through a process, so these channels answer inline
+  # (`ack-mode: on-complete`, no reply channel). The candidates are tried in order; the channel's
+  # `require:` keeps out a candidate that cannot do the job, and `fallback-on` (rate-limited,
+  # unavailable, timeout by default) moves to the next.
+
+  # Live transcription, one session per participant's track: every candidate must have live
+  # audio sessions. Each open session holds one `concurrency` permit (one per participant).
+  - name: meeting-transcription
+    direction: outbound
+    transport: llm
+    bind: "llm://meeting-transcription"
+    ack-mode: on-complete
+    llm:
+      require: [realtime]
+      concurrency: 16
+      candidates:
+        - provider: openai
+          model: gpt-realtime             # the session model (unused by a transcription session)
+          transcription-model: gpt-4o-transcribe
+          api-key: env:OPENAI_API_KEY
+        - provider: gemini                # the fallback: Gemini Live (asked to stay silent)
+          model: gemini-live-2.5-flash-preview
+          api-key: env:GEMINI_API_KEY
+
+  # Per-segment analysis: every candidate must read video. The segment's audio goes too, to a
+  # candidate that takes audio (one that cannot is skipped for that call — audio is never
+  # silently dropped). `timeout-seconds` bounds one model call.
+  - name: video-analysis
+    direction: outbound
+    transport: llm
+    bind: "llm://video-analysis"
+    ack-mode: on-complete
+    llm:
+      require: [video-understanding]
+      timeout-seconds: 60
+      concurrency: 4
+      candidates:
+        - provider: gemini                # native Gemini: frames as image parts + segment audio
+          model: gemini-2.5-flash
+          api-key: env:GEMINI_API_KEY
+        - provider: gemini                # the fallback: a lighter Gemini model, same inputs
+          model: gemini-2.5-flash-lite
+          api-key: env:GEMINI_API_KEY

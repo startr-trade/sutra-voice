@@ -1,0 +1,37 @@
+# cargo-deny policy for the worker workspace — the same licence allowlist, source rules and
+# advisory handling as the engine's rust/deny.toml. `make worker-lint` runs it (lockfile only).
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = false
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.85
+private = { ignore = true }
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,65 @@
+# Channels for the ivr-dtmf module, 1.0.0 — a plain DTMF phone menu: recorded prompts, keys,
+# a decision table, data stores. No model is involved.
+#
+#   sutra package examples/ivr-dtmf/package --out examples/ivr-dtmf/deploy/deployments
+#
+# THE CALL. The `voip` transport serves the media WebSocket the PBX dials and turns the call into
+# messages, each carrying the call's id in `x-call-id` (plus `x-caller` / `x-called`):
+#
+#   call-start   a call to the menu's number        -> starts ivr-call
+#   call-dtmf    a key the caller pressed (RFC 2833 telephone events, relayed by the PBX)
+#   call-hangup  the call ended — the caller hung up, the menu hung up, or the call was transferred
+#
+# There is no `call-turn` channel: this menu listens for keys only, so the caller's speech is
+# never cut into turns or delivered.
+#
+# THE LINE. The call takes a slot of the engine's `trunk-main` capacity pool (declared in the
+# ENGINE configuration — see deploy/compose.yaml) and `session-end` returns it at the hang-up.
+
+channels:
+  # ---- the call --------------------------------------------------------------------------------
+
+  - name: call-start
+    transport: voip
+    bind: "number:+15551239000"
+    codec: json
+    pool: trunk-main
+    pool-call-key: header.x-call-id   # one slot per call
+    session-end:
+      on-message: call-hangup         # the hang-up (or the transfer) frees the line
+
+  - name: call-dtmf
+    transport: voip
+    event: call-dtmf
+    codec: json
+
+  - name: call-hangup
+    transport: voip
+    event: call-hangup
+    codec: json
+
+  # ---- what the flow does to the call -----------------------------------------------------------
+
+  # Synchronous: the task completes when the prompt has played. Body: { callId, prompt } — the
+  # name of a recorded prompt under the engine's SUTRA_VOIP_PROMPTS_DIR (`ivr-dtmf/menu` plays
+  # <dir>/ivr-dtmf/menu.wav). Keys pressed while a prompt plays are kept, in order, and handled
+  # as soon as it ends — so a caller who knows the menu can type ahead.
+  - name: play
+    direction: outbound
+    transport: voip
+    bind: "voip://play"
+    ack-mode: on-complete
+
+  # Synchronous: { callId, target } — an extension on the PBX. The answer says whether the call
+  # was handed over (`status: transferred`) or had already ended (`status: ended`).
+  - name: transfer
+    direction: outbound
+    transport: voip
+    bind: "voip://transfer"
+    ack-mode: on-complete
+
+  # { callId, reason }
+  - name: hangup
+    direction: outbound
+    transport: voip
+    bind: "voip://hangup"

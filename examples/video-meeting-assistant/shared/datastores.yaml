@@ -1,0 +1,38 @@
+# Data stores of the video-meeting-assistant module, 1.0.0 — referenced BY NAME from the BPMN.
+# All three are key -> JSON items in the generic table (migrations/stores):
+#
+#   transcripts  "<callId>:<seq>"                    one final transcript segment, attributed to
+#                                                    the participant whose track it came from
+#   analysis     "<callId>:<participantIndex>:<n>"   one analysed participant over segment n
+#   meetings     "session:<callId>"                  the session record and its rendered report
+#
+# All three hold personal data (what people said, an analysis of how they appeared and sounded).
+# The processes tag their messages with GDPR data classes, so subject erasure and retention apply
+# to them — and to the recordings they reference — like any other personal data.
+datastores:
+  - name: transcripts
+    type: sql
+    sql:
+      url-ref: env:MEETING_DB_URL
+      username-ref: env:MEETING_DB_USER
+      password-ref: env:MEETING_DB_PASSWORD
+      migrations: migrations/transcripts
+    dataClass: personal
+
+  - name: analysis
+    type: sql
+    sql:
+      url-ref: env:MEETING_DB_URL
+      username-ref: env:MEETING_DB_USER
+      password-ref: env:MEETING_DB_PASSWORD
+      migrations: migrations/analysis
+    dataClass: personal
+
+  - name: meetings
+    type: sql
+    sql:
+      url-ref: env:MEETING_DB_URL
+      username-ref: env:MEETING_DB_USER
+      password-ref: env:MEETING_DB_PASSWORD
+      migrations: migrations/meetings
+    dataClass: personal

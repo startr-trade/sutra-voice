@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+
+# SUTRA-VOICE crates only. The engine is NOT a member of this workspace — it is the `engine/`
+# submodule (the public Sutra repository), consumed as PATH DEPENDENCIES declared once in
+# [workspace.dependencies] below. That keeps the two trees' member sets disjoint (an engine crate
+# resolves its own `workspace = true` inheritance against engine/rust/Cargo.toml) while this
+# workspace's single Cargo.lock unifies the whole graph, so no crate is linked at two versions.
+#
+# The WebRTC media worker (tools/sutra-webrtc-worker) is deliberately NOT here either: it is its
+# own Cargo workspace with its own lockfile, built only in Docker, so nothing in this workspace
+# ever needs libwebrtc or its clang toolchain.
+members = [
+    # The `voip` transport: media WebSocket, VAD turns, paced playback, listen-only calls,
+    # meeting sessions, segment analysis, the rustpbx gateway client.
+    "crates/sutra-transport-voip",
+    # The composition root — the engine's default bundle plus the voip transport, one binary.
+    "crates/sutra-voice-dist",
+    # Tests-only: the voice tier-2 suites, driven through the engine's sutra-testkit harness.
+    "crates/sutra-voice-conformance",
+]
+
+# Mirrors the engine's profiles, so a sutra-voice binary has the same size and speed as the
+# engine binary it replaces, and `--profile release-it` means the same thing on both sides.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[profile.release-it]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[workspace.package]
+# sutra-voice releases on its own train; the first release is 0.6.0, cut alongside the engine
+# release it is pinned to. `sutra-voice-engine --version` style reporting is not wired yet.
+version = "0.6.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/startr-trade/sutra-voice"
+publish = false
+
+[workspace.dependencies]
+# ---- engine crates (the `engine/` submodule) ----------------------------------------------
+# Paths are relative to THIS file's directory (sutra-voice/rust): one level up to the repo root
+# and into the submodule. Declared once here so a submodule relocation is a single edit.
+sutra-channels = { path = "../engine/rust/crates/sutra-channels" }
+sutra-codec-spi = { path = "../engine/rust/crates/sutra-codec-spi" }
+sutra-crypto = { path = "../engine/rust/crates/sutra-crypto" }
+sutra-engine = { path = "../engine/rust/crates/sutra-engine" }
+sutra-envref-aws = { path = "../engine/rust/crates/sutra-envref-aws" }
+sutra-envref-azure = { path = "../engine/rust/crates/sutra-envref-azure" }
+sutra-envref-gcp = { path = "../engine/rust/crates/sutra-envref-gcp" }
+sutra-envref-spi = { path = "../engine/rust/crates/sutra-envref-spi" }
+sutra-envref-vault = { path = "../engine/rust/crates/sutra-envref-vault" }
+sutra-formats = { path = "../engine/rust/crates/sutra-formats" }
+sutra-llm-anthropic = { path = "../engine/rust/crates/sutra-llm-anthropic" }
+sutra-llm-bedrock = { path = "../engine/rust/crates/sutra-llm-bedrock" }
+sutra-llm-gemini = { path = "../engine/rust/crates/sutra-llm-gemini" }
+sutra-llm-openai = { path = "../engine/rust/crates/sutra-llm-openai" }
+sutra-llm-spi = { path = "../engine/rust/crates/sutra-llm-spi" }
+sutra-loader = { path = "../engine/rust/crates/sutra-loader" }
+sutra-objectstore = { path = "../engine/rust/crates/sutra-objectstore" }
+sutra-testkit = { path = "../engine/rust/crates/sutra-testkit" }
+sutra-transport-amqp = { path = "../engine/rust/crates/sutra-transport-amqp" }
+sutra-transport-dapr = { path = "../engine/rust/crates/sutra-transport-dapr" }
+sutra-transport-file = { path = "../engine/rust/crates/sutra-transport-file" }
+sutra-transport-gcp-pubsub = { path = "../engine/rust/crates/sutra-transport-gcp-pubsub" }
+sutra-transport-http = { path = "../engine/rust/crates/sutra-transport-http" }
+sutra-transport-kafka = { path = "../engine/rust/crates/sutra-transport-kafka" }
+sutra-transport-knative = { path = "../engine/rust/crates/sutra-transport-knative" }
+sutra-transport-llm = { path = "../engine/rust/crates/sutra-transport-llm" }
+sutra-transport-rabbitmq = { path = "../engine/rust/crates/sutra-transport-rabbitmq" }
+sutra-transport-spi = { path = "../engine/rust/crates/sutra-transport-spi" }
+sutra-transport-sqs = { path = "../engine/rust/crates/sutra-transport-sqs" }
+
+# ---- third-party --------------------------------------------------------------------------
+# Requirements deliberately match the engine workspace's, so the lockfile resolves ONE version
+# of each and nothing is linked twice across the seam (serde_json / time / tracing types cross
+# crate boundaries between engine and voice crates).
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+testcontainers = { version = "0.27", features = ["blocking"] }
+time = { version = "0.3", features = ["parsing", "formatting", "macros", "large-dates"] }
+tracing = "0.1"

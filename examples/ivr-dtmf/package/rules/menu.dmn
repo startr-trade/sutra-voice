@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The menu: which key reaches which extension, and who may reach it. Change the menu here — the
+  flow does not name a single extension.
+
+  Input (a process variable, set by the flow before this task):
+    choice      string   the key the caller pressed ("0"-"9", "*", "#")
+
+  Outputs (merged back into the process variables):
+    extension   string   the PBX extension to transfer to; null for a key the menu does not offer
+    department  string   what the extension is (logged with the transfer)
+    access      string   "open"            anyone may be transferred
+                         "customers-only"  a caller whose number is in `customers`, or anyone
+                                           with a valid PIN for the extension (`extension_pins`)
+                         "invalid"         not a menu choice — the menu is played again
+
+  FIRST hit policy: the first matching rule wins; "-" matches anything.
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20230324/MODEL/"
+             namespace="urn:sutra:module:ivr-dtmf:menu">
+  <decision id="menuChoice" name="Menu choice">
+    <decisionTable hitPolicy="FIRST">
+      <input id="i_choice"><inputExpression typeRef="string"><text>choice</text></inputExpression></input>
+      <output id="o_extension" name="extension" typeRef="string"/>
+      <output id="o_department" name="department" typeRef="string"/>
+      <output id="o_access" name="access" typeRef="string"/>
+      <rule id="r_sales">
+        <inputEntry><text>"1"</text></inputEntry>
+        <outputEntry><text>"201"</text></outputEntry>
+        <outputEntry><text>"sales"</text></outputEntry>
+        <outputEntry><text>"open"</text></outputEntry>
+      </rule>
+      <rule id="r_support">
+        <inputEntry><text>"2"</text></inputEntry>
+        <outputEntry><text>"202"</text></outputEntry>
+        <outputEntry><text>"support"</text></outputEntry>
+        <outputEntry><text>"customers-only"</text></outputEntry>
+      </rule>
+      <rule id="r_accounts">
+        <inputEntry><text>"3"</text></inputEntry>
+        <outputEntry><text>"203"</text></outputEntry>
+        <outputEntry><text>"accounts"</text></outputEntry>
+        <outputEntry><text>"customers-only"</text></outputEntry>
+      </rule>
+      <rule id="r_front_desk">
+        <inputEntry><text>"0"</text></inputEntry>
+        <outputEntry><text>"200"</text></outputEntry>
+        <outputEntry><text>"front desk"</text></outputEntry>
+        <outputEntry><text>"open"</text></outputEntry>
+      </rule>
+      <rule id="r_invalid">
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>null</text></outputEntry>
+        <outputEntry><text>null</text></outputEntry>
+        <outputEntry><text>"invalid"</text></outputEntry>
+      </rule>
+    </decisionTable>
+  </decision>
+</definitions>

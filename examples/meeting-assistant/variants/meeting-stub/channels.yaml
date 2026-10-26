@@ -1,0 +1,167 @@
+# Channels for the meeting-assistant module, 1.0.0 — the stub variant: the live transcription
+# session and the report model are the stub in examples/model-stub, so the package runs
+# with no key and no network. This is the variant the engine's tier-2 test deploys; the live
+# variant differs only in the `meeting-transcription`, `report-model` and `report-out` channels.
+#
+#   sutra package examples/meeting-assistant/variants/meeting-stub \
+#       --overlay examples/meeting-assistant/shared --out examples/meeting-assistant/deploy/deployments
+#
+# THE CALL. The bot DIALS the conference: `originate` (mode: listen) through the PBX's trunk, then
+# the meeting PIN as DTMF, then the consent announcement. From then on it only listens: the
+# `voip` transport records the audio (the process audits at `capture="media"`) and streams it to
+# a live transcription session; the flow hears only sparse events — the outcome of the dial,
+# keywords, the hang-up.
+#
+# THE LINE. `originate` takes a slot of the engine's `trunk-main` capacity pool; the hang-up
+# (`session-end` on the `join` channel) returns it.
+
+channels:
+  # ---- the hand-off -------------------------------------------------------------------------------
+
+  # { meetingId, title, dialIn, pin, participants: [{name, role: internal|external}],
+  #   analysis?: {internalOptIn} } — 202 at once; the call is made from here.
+  - name: join
+    transport: http
+    bind: "POST /channels/join"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:MEETING_API_KEY
+        header: X-Api-Key
+    session-end:
+      on-message: call-hangup         # the end of the call frees its trunk slot
+
+  # A standing meeting, handed over by scheduled-join (the timer-started process).
+  - name: join-scheduled
+    transport: local
+    codec: json
+    session-end:
+      on-message: call-hangup
+
+  - name: schedule-join
+    direction: outbound
+    transport: local
+    bind: "local://join-scheduled"
+
+  # ---- the call's events ------------------------------------------------------------------------
+
+  - name: call-progress
+    transport: voip
+    event: call-progress
+    codec: json
+    statuses: [connected, busy, no-answer, failed]   # one wait sees the outcome of the dial
+
+  # A phrase was heard (in a final transcript segment).
+  - name: call-keyword
+    transport: voip
+    event: call-keyword
+    codec: json
+    phrases: [action item, deadline, decision]
+
+  - name: call-hangup
+    transport: voip
+    event: call-hangup
+    codec: json
+
+  # Each final transcript segment, as it completes: { callId, seq, key, speaker, speakerSource,
+  # startMs, endMs, text, channel, provider, model, features } — starts transcript-segment, which
+  # stores it. THE LIVE SESSION is opened transcription-only (it never answers) through the
+  # `meeting-transcription` llm channel below: the model is configured there, once, like any
+  # other model call of the package.
+  - name: call-transcript
+    transport: voip
+    event: call-transcript
+    codec: json
+    transcribe:
+      channel: meeting-transcription      # the llm channel the live session is opened through
+      language: en
+      drain-ms: 3000                      # how long the session may finish after the hang-up
+
+  # The model the transport transcribes with — called by the voip transport itself (the audio
+  # goes from the transport to the provider; it never passes through a process), so it answers
+  # inline (`ack-mode: on-complete`, no reply channel). `require: [realtime]`: only a candidate
+  # with live audio sessions serves it; the session opens on the first that does, falling back on
+  # the channel's `fallback-on` classes. Each open session holds one `concurrency` permit.
+  - name: meeting-transcription
+    direction: outbound
+    transport: llm
+    bind: "llm://meeting-transcription"
+    ack-mode: on-complete
+    llm:
+      require: [realtime]
+      concurrency: 8
+      candidates:
+        - provider: openai
+          model: gpt-realtime-stub        # the stub answers transcription sessions
+          transcription-model: gpt-4o-transcribe
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+
+  # ---- what the flow does to the call -----------------------------------------------------------
+
+  # { callId, destination, callerId, timeoutSecs, mode: "listen" }. The request carries the
+  # process's `capture=media` mark, which is what makes the transport record the call.
+  - name: originate
+    direction: outbound
+    transport: voip
+    bind: "voip://originate"
+    pool: trunk-main
+    pool-call-key: header.x-call-id
+
+  # Synchronous: { callId, digits, gapMs } — the PIN, one key every gapMs; answers how many
+  # keys were sent (never the keys).
+  - name: dtmf
+    direction: outbound
+    transport: voip
+    bind: "voip://dtmf"
+    ack-mode: on-complete
+
+  # Synchronous: { callId, prompt, consent: true } — completes when the announcement has played;
+  # played to the end, it is what the recording's `consentAnnounced` reports.
+  - name: play
+    direction: outbound
+    transport: voip
+    bind: "voip://play"
+    ack-mode: on-complete
+
+  - name: hangup
+    direction: outbound
+    transport: voip
+    bind: "voip://hangup"
+
+  # ---- the report ---------------------------------------------------------------------------------
+
+  # A background job (a long transcript holds no connection): submitted, then polled; the result
+  # arrives on `report-reply`, with the parsed JSON under `json` (the request says `json: true`).
+  - name: report-model
+    direction: outbound
+    transport: llm
+    bind: "llm://report-model"
+    llm:
+      mode: job
+      reply-channel: report-reply
+      candidates:
+        - provider: openai
+          model: gpt-meeting-report-stub   # the stub answers a JSON job for a `meeting` model id
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+          completion: poll
+          poll-interval-seconds: 2
+          job-timeout-seconds: 1800
+      max-output-tokens: 1500
+      timeout-seconds: 60
+
+  - name: report-reply
+    transport: local
+    codec: json
+
+  # Where the finished report goes: { meetingId, title, summary, decisions, actionItems,
+  # speakers, report (the rendered text), recording (the reference) }.
+  - name: report-out
+    direction: outbound
+    transport: http
+    bind: "http://model-stub:8000/sink"
+    cloudevents-mode: none

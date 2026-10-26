@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The row types of the ivr-dtmf module's data stores (datastores.yaml `structure: {schema:
+  urn:ivr, type: …}`): each complexType below is one store's table, one typed column per child.
+
+  Every child is a scalar with maxOccurs=1 — a projected store must be flat. Facets are
+  load-bearing: maxLength sizes each VARCHAR, and `sutra lint` compares them against the DDL in
+  migrations/<store>/. A minOccurs="0" child is a NULL-admitting column. Column names are the
+  default fold of the field names (lowerCamel -> snake_case: expiresAt -> expires_at).
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:ivr"
+           xmlns="urn:sutra:ivr"
+           elementFormDefault="qualified">
+
+  <xs:simpleType name="PhoneNumber">
+    <xs:restriction base="xs:string"><xs:maxLength value="20"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Extension">
+    <xs:restriction base="xs:string"><xs:maxLength value="10"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Pin">
+    <xs:restriction base="xs:string"><xs:maxLength value="12"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="ShortText">
+    <xs:restriction base="xs:string"><xs:maxLength value="40"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Note">
+    <xs:restriction base="xs:string"><xs:maxLength value="120"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="CallId">
+    <xs:restriction base="xs:string"><xs:maxLength value="64"/></xs:restriction>
+  </xs:simpleType>
+
+  <!-- `customers`, keyed by the phone number. A caller whose number is here reaches the
+       customers-only extensions without a PIN. -->
+  <xs:complexType name="Customer">
+    <xs:sequence>
+      <xs:element name="number" type="PhoneNumber"/>
+      <xs:element name="name"   type="ShortText"/>
+      <xs:element name="since"  type="xs:date" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- `extension_pins`, keyed by "<extension>:<pin>". The note says who the PIN was shared with;
+       it is what the transfer log records, never the PIN. -->
+  <xs:complexType name="ExtensionPin">
+    <xs:sequence>
+      <xs:element name="extension" type="Extension"/>
+      <xs:element name="pin"       type="Pin"/>
+      <xs:element name="note"      type="Note"/>
+      <xs:element name="active"    type="xs:boolean"/>
+      <xs:element name="expiresAt" type="xs:dateTime" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- `transfer_log`, keyed by "<callId>/<n>". outcome: transferred | pin-refused | gave-up |
+       hung-up. method (how a transfer was allowed): open | customer | pin. reason: why a PIN was
+       refused (wrong | inactive | expired) or why the call gave up. Never the digits. -->
+  <xs:complexType name="TransferLogEntry">
+    <xs:sequence>
+      <xs:element name="callId"       type="CallId"/>
+      <xs:element name="caller"       type="PhoneNumber"/>
+      <xs:element name="extension"    type="Extension" minOccurs="0"/>
+      <xs:element name="department"   type="ShortText" minOccurs="0"/>
+      <xs:element name="outcome"      type="ShortText"/>
+      <xs:element name="method"       type="ShortText" minOccurs="0"/>
+      <xs:element name="reason"       type="ShortText" minOccurs="0"/>
+      <xs:element name="note"         type="Note" minOccurs="0"/>
+      <xs:element name="menuAttempts" type="xs:int"/>
+      <xs:element name="pinAttempts"  type="xs:int"/>
+      <xs:element name="loggedAt"     type="xs:dateTime"/>
+    </xs:sequence>
+  </xs:complexType>
+
+</xs:schema>

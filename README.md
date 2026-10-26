@@ -1,0 +1,79 @@
+# sutra-voice
+
+Phone calls, IVRs and meetings for the [Sutra](https://github.com/startr-trade/sutra) workflow
+engine. A BPMN flow answers a number, hears the caller one utterance at a time, speaks back,
+transfers, hangs up, places calls of its own, or sits in on a conference or a video meeting —
+recording, transcribing and analysing it through the engine's `llm` channels.
+
+sutra-voice is open source under **MIT OR Apache-2.0**, like the engine. It does not fork the
+engine: it consumes it as a git submodule and adds a transport through the engine's transport
+SPI, plus its own engine image with that transport linked in.
+
+Voice, meeting and video support is a **preview** in 0.6.0.
+
+## What is here
+
+| Path | What it is |
+|---|---|
+| `rust/crates/sutra-transport-voip` | The `voip` transport: a media WebSocket on the engine's HTTP listener, energy-VAD turns, real-time paced playback with barge-in, number binding, listen-only calls (recorded to an object store, sealed, transcribed live), meeting sessions (one tagged socket per meeting, per-participant audio and frames), segment analysis, and the rustpbx call-control client. |
+| `rust/crates/sutra-voice-dist` | The composition root: the engine's default bundle plus `voip`, producing the `sutra-voice-engine` binary and image. |
+| `rust/crates/sutra-voice-conformance` | The end-to-end suites (tier 2, Docker) and the example lint (tier 1). |
+| `tools/sutra-webrtc-worker` | The WebRTC media worker — its own Cargo workspace and image, so nothing else links libwebrtc. Joins a LiveKit room and streams every participant to the engine. |
+| `examples/voice-assistant` | An agentic responder on a number, post-call analytics, appointment-reminder calls on a capacity pool. rustpbx + SIPp. |
+| `examples/ivr-dtmf` | A DTMF phone menu with recorded prompts, a DMN menu table, PIN entry and transfers. No model. |
+| `examples/meeting-assistant` | Joins a conference by its SIP dial-in, records and transcribes it, writes the minutes. |
+| `examples/video-meeting-assistant` | The same for a LiveKit video meeting, through the WebRTC worker, with per-participant segment analysis. |
+| `examples/model-stub` | The stub model server the examples and tests use — no key, no network. |
+| `docs/` | The user guides: [the `voip` transport](docs/voip-transport.md) and [the WebRTC worker](docs/webrtc-worker.md). |
+| `engine/` | The engine, as a git submodule (the public Sutra repository). |
+
+Everything about BPMN itself — elements, wait states, channels, `llm` channels, packaging — is
+the engine's, documented in the [Sutra book](https://sutra.startr.trade/). Start with
+[channels and transports](https://sutra.startr.trade/building/channels.html) and
+[calling a language model](https://sutra.startr.trade/building/llm-channels.html).
+
+## Build
+
+```bash
+git clone --recurse-submodules https://github.com/startr-trade/sutra-voice
+cd sutra-voice
+make submodule        # if you cloned without --recurse-submodules
+make build            # the workspace; engine crates come in as path dependencies
+make image            # sutra-voice-engine:dev (fast release-it profile)
+make worker-image     # sutra-webrtc-worker:dev (in Docker; first build fetches libwebrtc)
+```
+
+The image runs exactly like the engine's (`SUTRA_DEPLOYMENTS_DIR`, `SUTRA_HTTP_PORT`,
+`SUTRA_DATASOURCE_*`), plus the transport's `SUTRA_VOIP_*` settings described in
+[docs/voip-transport.md](docs/voip-transport.md). Package an example with the engine's `sutra`
+CLI ([installation](https://sutra.startr.trade/getting-started/installation.html)); each example's
+README has the exact commands and a local compose stack.
+
+## Test
+
+| Tier | Command | Needs |
+|---|---|---|
+| 1 | `make test` | the Rust toolchain |
+| 2 | `make image && make test-docker` | Docker |
+| worker | `make worker-lint worker-test` | Docker |
+
+`make lint` (clippy `-D warnings`), `make fmt-check`, `make audit` (cargo-audit + cargo-deny) and
+`make scan-deps` / `make scan-image` / `make worker-scan` (Trivy) are the other gates; CI runs
+fmt, lint, tier 1 and audit.
+
+## The engine pin
+
+`engine/` pins one exact engine commit (`git submodule status`). An engine change reaches this
+repository only when the pin moves — a commit here that changes the submodule SHA. Never edit
+files under `engine/` from this repository; make the change in the engine and move the pin.
+
+> The initial pin is an engine commit that is not yet on GitHub. Until it is pushed to
+> `github.com/startr-trade/sutra`, a fresh `git submodule update` cannot fetch it; a clone made
+> next to a local engine checkout can fetch it from there
+> (`git -C engine fetch <path-to-engine-checkout>`).
+
+## License
+
+Dual-licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option. The engine submodule carries its own (identical)
+licence terms.

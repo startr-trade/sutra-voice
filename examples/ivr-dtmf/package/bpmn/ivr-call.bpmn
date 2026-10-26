@@ -1,0 +1,569 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A PHONE MENU: recorded prompts, keys, a decision table, data stores. No model is involved.
+
+  The voip transport hands the call to the engine as messages carrying the call's id in the
+  `x-call-id` header. This process IS the call: it starts on `call-start` and every later key and
+  the hang-up find it through the start event's alias. It is one instance from the first prompt
+  to the hang-up, and both of its retry rules are real loops back to a wait:
+
+    call-start
+      -> MENU: play the menu -> wait: a key, 6 s of nothing, or the caller hangs up
+           key -> the menu table (DMN): extension + access rule
+           not a menu choice, or nothing pressed -> "not a valid choice" -> the menu AGAIN
+             (up to 3 times in all, then "sorry" and hang up)
+      -> access "open"            -> transfer
+         access "customers-only"  -> the caller's number in `customers`?
+             found     -> transfer
+             not found -> PIN: "enter your PIN, then #" -> collect keys until # (one wait per key,
+                          8 s of nothing ends the entry) -> `extension_pins` "<extension>:<pin>"
+                  active and not expired -> transfer, logging the PIN's note
+                  otherwise              -> log the refusal (never the digits) -> "wrong PIN"
+                                            -> enter it AGAIN (3 tries in all), then "sorry"
+                                            and hang up
+      -> TRANSFER: "transferring you" -> voip://transfer to the extension -> log it
+      -> wait for the end of the call (the transfer ends it for the engine) -> end
+
+  Every transfer, refused PIN and call that gave up or hung up is a row in `transfer_log`.
+
+  THE DIGITS. A PIN's keys arrive as `pinKey` and build `pinDigits`; both are `sensitive`, so
+  logs, audit sinks and diagnostics redact them, and the process audits metadata only. The
+  digits are cleared as soon as they have been checked, and no log row carries them.
+
+  PROMPTS are recorded files, played by name from the engine's SUTRA_VOIP_PROMPTS_DIR
+  (`ivr-dtmf/menu` is <dir>/ivr-dtmf/menu.wav). Keys pressed while a prompt plays are handled,
+  in order, as soon as it ends.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_ivr_call"
+                  targetNamespace="urn:sutra:module:ivr-dtmf:1.0.0">
+
+  <bpmn:dataStore id="customersStore" name="customers"/>
+  <bpmn:dataStore id="pinsStore" name="extension_pins"/>
+  <bpmn:dataStore id="logStore" name="transfer_log"/>
+
+  <bpmn:process id="ivr-call" name="Route a call through the phone menu" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+      <q:variables>
+        <q:variable name="callId" type="string"/>
+        <q:variable name="caller" type="string" sensitive="true" subjectKey="true"/>
+        <q:variable name="menuAttempts" type="number"/>
+        <q:variable name="pinAttempts" type="number"/>
+        <q:variable name="pinDigits" type="string" sensitive="true"/>
+        <q:variable name="pinKey" sensitive="true"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doCustomer" name="customer"/>
+    <bpmn:dataObject id="doPin" name="pin"/>
+    <bpmn:dataObject id="doLogEntry" name="logEntry"/>
+    <bpmn:dataStoreReference id="dsrCustomer" name="customers" dataStoreRef="customersStore">
+      <bpmn:extensionElements><q:store key="caller"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrPin" name="extension_pins" dataStoreRef="pinsStore">
+      <bpmn:extensionElements><q:store key="extension + &quot;:&quot; + pinDigits"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrLogRefusal" name="transfer_log" dataStoreRef="logStore">
+      <bpmn:extensionElements><q:store key="callId + &quot;/&quot; + string(logSeq)"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrLogTransfer" name="transfer_log" dataStoreRef="logStore">
+      <bpmn:extensionElements><q:store key="callId + &quot;/&quot; + string(logSeq)"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrLogGaveUp" name="transfer_log" dataStoreRef="logStore">
+      <bpmn:extensionElements><q:store key="callId + &quot;/&quot; + string(logSeq)"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrLogHungUp" name="transfer_log" dataStoreRef="logStore">
+      <bpmn:extensionElements><q:store key="callId + &quot;/&quot; + string(logSeq)"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- ===================================================================== the call -->
+
+    <!-- { callId, from, to, direction, format, gateway } -->
+    <bpmn:startEvent id="Start" name="Call to the menu's number">
+      <bpmn:extensionElements>
+        <q:source channel="call-start" name="call"/>
+        <q:alias name="callKey" expression="getValue(header, &quot;x-call-id&quot;)" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="Init"/>
+
+    <bpmn:serviceTask id="Init" name="The call's facts (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_init</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>call.callId</bpmn:from><bpmn:to>callId</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>if call.from = null then "unknown" else call.from</bpmn:from><bpmn:to>caller</bpmn:to></bpmn:assignment>
+        <!-- How many times the menu is offered, and how many PIN entries a caller gets. -->
+        <bpmn:assignment><bpmn:from>3</bpmn:from><bpmn:to>maxMenuAttempts</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>3</bpmn:from><bpmn:to>maxPinAttempts</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>0</bpmn:from><bpmn:to>menuAttempts</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>0</bpmn:from><bpmn:to>pinAttempts</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>0</bpmn:from><bpmn:to>logSeq</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>extension</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>department</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>method</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>note</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>""</bpmn:from><bpmn:to>pinDigits</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_init" sourceRef="Init" targetRef="PrepMenu"/>
+
+    <!-- ===================================================================== the menu -->
+
+    <!-- The loop's entry: the first time the welcome, after that the menu on its own. -->
+    <bpmn:serviceTask id="PrepMenu" name="Offer the menu (FEEL)">
+      <bpmn:incoming>F_init</bpmn:incoming>
+      <bpmn:incoming>F_menu_again</bpmn:incoming>
+      <bpmn:outgoing>F_prep_menu</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, prompt: if menuAttempts = 0 then "ivr-dtmf/welcome" else "ivr-dtmf/menu"}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>menuAttempts + 1</bpmn:from><bpmn:to>menuAttempts</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_menu" sourceRef="PrepMenu" targetRef="PlayMenu"/>
+
+    <bpmn:serviceTask id="PlayMenu" name="Play the menu" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_menu</bpmn:incoming><bpmn:outgoing>F_played_menu</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_menu" sourceRef="PlayMenu" targetRef="MenuWait"/>
+
+    <!-- Re-entered on every pass round the menu loop: each pass is a new wait, with its own timer. -->
+    <bpmn:eventBasedGateway id="MenuWait" name="Wait for a choice">
+      <bpmn:incoming>F_played_menu</bpmn:incoming>
+      <bpmn:outgoing>F_to_menu_key</bpmn:outgoing>
+      <bpmn:outgoing>F_to_menu_silence</bpmn:outgoing>
+      <bpmn:outgoing>F_to_menu_hangup</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_menu_key" sourceRef="MenuWait" targetRef="MenuKey"/>
+    <bpmn:sequenceFlow id="F_to_menu_silence" sourceRef="MenuWait" targetRef="MenuSilence"/>
+    <bpmn:sequenceFlow id="F_to_menu_hangup" sourceRef="MenuWait" targetRef="MenuHangup"/>
+
+    <!-- { callId, digit } -->
+    <bpmn:intermediateCatchEvent id="MenuKey" name="A key">
+      <bpmn:extensionElements><q:source channel="call-dtmf" name="key"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_menu_key</bpmn:incoming><bpmn:outgoing>F_menu_key</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="MenuSilence" name="Nothing for 6 s">
+      <bpmn:incoming>F_to_menu_silence</bpmn:incoming><bpmn:outgoing>F_menu_silence</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT6S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="MenuHangup" name="The caller hung up">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_menu_hangup</bpmn:incoming><bpmn:outgoing>F_menu_hangup</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_menu_hangup" sourceRef="MenuHangup" targetRef="PrepHungUp"/>
+
+    <bpmn:serviceTask id="TakeChoice" name="The choice (FEEL)">
+      <bpmn:incoming>F_menu_key</bpmn:incoming><bpmn:outgoing>F_took_choice</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>key.digit</bpmn:from><bpmn:to>choice</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_menu_key" sourceRef="MenuKey" targetRef="TakeChoice"/>
+    <bpmn:sequenceFlow id="F_took_choice" sourceRef="TakeChoice" targetRef="Choose"/>
+
+    <bpmn:businessRuleTask id="Choose" name="Which extension, and who may reach it (DMN)" implementation="menu.dmn">
+      <bpmn:incoming>F_took_choice</bpmn:incoming><bpmn:outgoing>F_chosen</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:sequenceFlow id="F_chosen" sourceRef="Choose" targetRef="Access"/>
+
+    <bpmn:exclusiveGateway id="Access" name="Access rule" default="F_invalid">
+      <bpmn:incoming>F_chosen</bpmn:incoming>
+      <bpmn:outgoing>F_open</bpmn:outgoing>
+      <bpmn:outgoing>F_customers_only</bpmn:outgoing>
+      <bpmn:outgoing>F_invalid</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_open" name="open" sourceRef="Access" targetRef="OpenAccess">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">access = "open"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_customers_only" name="customers only" sourceRef="Access" targetRef="FindCustomer">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">access = "customers-only"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_invalid" name="not a choice" sourceRef="Access" targetRef="MenuAgain"/>
+    <bpmn:sequenceFlow id="F_menu_silence" sourceRef="MenuSilence" targetRef="MenuAgain"/>
+
+    <!-- Not a valid choice, or nothing pressed: offer the menu again, or give up. -->
+    <bpmn:exclusiveGateway id="MenuAgain" name="Offer it again?" default="F_menu_exhausted">
+      <bpmn:incoming>F_invalid</bpmn:incoming>
+      <bpmn:incoming>F_menu_silence</bpmn:incoming>
+      <bpmn:outgoing>F_retry_menu</bpmn:outgoing>
+      <bpmn:outgoing>F_menu_exhausted</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_retry_menu" name="tries left" sourceRef="MenuAgain" targetRef="PrepInvalid">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">menuAttempts &lt; maxMenuAttempts</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_menu_exhausted" sourceRef="MenuAgain" targetRef="NoChoice"/>
+
+    <bpmn:serviceTask id="PrepInvalid" name="Not a valid choice (FEEL)">
+      <bpmn:incoming>F_retry_menu</bpmn:incoming><bpmn:outgoing>F_prep_invalid</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, prompt: "ivr-dtmf/invalid"}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_invalid" sourceRef="PrepInvalid" targetRef="PlayInvalid"/>
+    <bpmn:serviceTask id="PlayInvalid" name="Play &quot;not a valid choice&quot;" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_invalid</bpmn:incoming><bpmn:outgoing>F_menu_again</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <!-- THE MENU LOOP: back to the menu, and so to the same wait. -->
+    <bpmn:sequenceFlow id="F_menu_again" sourceRef="PlayInvalid" targetRef="PrepMenu"/>
+
+    <bpmn:serviceTask id="NoChoice" name="No valid choice (FEEL)">
+      <bpmn:incoming>F_menu_exhausted</bpmn:incoming><bpmn:outgoing>F_no_choice</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"no-valid-choice"</bpmn:from><bpmn:to>giveUpReason</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_no_choice" sourceRef="NoChoice" targetRef="PrepSorry"/>
+
+    <!-- ===================================================================== who may reach it -->
+
+    <bpmn:serviceTask id="OpenAccess" name="Anyone may (FEEL)">
+      <bpmn:incoming>F_open</bpmn:incoming><bpmn:outgoing>F_open_access</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"open"</bpmn:from><bpmn:to>method</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_open_access" sourceRef="OpenAccess" targetRef="PrepTransferring"/>
+
+    <!-- The caller's number (x-caller) in `customers` — null when it is not there. -->
+    <bpmn:serviceTask id="FindCustomer" name="Is the caller a customer?">
+      <bpmn:incoming>F_customers_only</bpmn:incoming><bpmn:outgoing>F_found_customer</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrCustomer</bpmn:sourceRef>
+        <bpmn:targetRef>doCustomer</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_found_customer" sourceRef="FindCustomer" targetRef="Known"/>
+
+    <bpmn:exclusiveGateway id="Known" name="A customer?" default="F_not_customer">
+      <bpmn:incoming>F_found_customer</bpmn:incoming>
+      <bpmn:outgoing>F_customer</bpmn:outgoing>
+      <bpmn:outgoing>F_not_customer</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_customer" name="yes" sourceRef="Known" targetRef="CustomerAccess">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">customer != null</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_not_customer" name="no: ask for a PIN" sourceRef="Known" targetRef="PrepPin"/>
+
+    <bpmn:serviceTask id="CustomerAccess" name="A customer may (FEEL)">
+      <bpmn:incoming>F_customer</bpmn:incoming><bpmn:outgoing>F_customer_access</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"customer"</bpmn:from><bpmn:to>method</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_customer_access" sourceRef="CustomerAccess" targetRef="PrepTransferring"/>
+
+    <!-- ===================================================================== the PIN -->
+
+    <!-- The PIN loop's entry: a fresh entry, its own attempt. -->
+    <bpmn:serviceTask id="PrepPin" name="Ask for the PIN (FEEL)">
+      <bpmn:incoming>F_not_customer</bpmn:incoming>
+      <bpmn:incoming>F_pin_again</bpmn:incoming>
+      <bpmn:outgoing>F_prep_pin</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>pinAttempts + 1</bpmn:from><bpmn:to>pinAttempts</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>""</bpmn:from><bpmn:to>pinDigits</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: callId, prompt: "ivr-dtmf/enter-pin"}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_pin" sourceRef="PrepPin" targetRef="PlayPin"/>
+    <bpmn:serviceTask id="PlayPin" name="Play &quot;enter your PIN, then #&quot;" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_pin</bpmn:incoming><bpmn:outgoing>F_played_pin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_pin" sourceRef="PlayPin" targetRef="PinWait"/>
+
+    <!-- One wait per key: the digit loop comes back here after every key but #. -->
+    <bpmn:eventBasedGateway id="PinWait" name="Wait for the next key">
+      <bpmn:incoming>F_played_pin</bpmn:incoming>
+      <bpmn:incoming>F_next_key</bpmn:incoming>
+      <bpmn:outgoing>F_to_pin_key</bpmn:outgoing>
+      <bpmn:outgoing>F_to_pin_silence</bpmn:outgoing>
+      <bpmn:outgoing>F_to_pin_hangup</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_pin_key" sourceRef="PinWait" targetRef="PinKey"/>
+    <bpmn:sequenceFlow id="F_to_pin_silence" sourceRef="PinWait" targetRef="PinSilence"/>
+    <bpmn:sequenceFlow id="F_to_pin_hangup" sourceRef="PinWait" targetRef="PinHangup"/>
+
+    <!-- { callId, digit } — sensitive: a PIN digit. -->
+    <bpmn:intermediateCatchEvent id="PinKey" name="A PIN key">
+      <bpmn:extensionElements><q:source channel="call-dtmf" name="pinKey"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_pin_key</bpmn:incoming><bpmn:outgoing>F_pin_key</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="PinSilence" name="Nothing for 8 s">
+      <bpmn:incoming>F_to_pin_silence</bpmn:incoming><bpmn:outgoing>F_pin_silence</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT8S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="PinHangup" name="The caller hung up">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_pin_hangup</bpmn:incoming><bpmn:outgoing>F_pin_hangup</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_pin_hangup" sourceRef="PinHangup" targetRef="PrepHungUp"/>
+    <bpmn:sequenceFlow id="F_pin_key" sourceRef="PinKey" targetRef="EndOfPin"/>
+
+    <bpmn:exclusiveGateway id="EndOfPin" name="#?" default="F_digit">
+      <bpmn:incoming>F_pin_key</bpmn:incoming>
+      <bpmn:outgoing>F_hash</bpmn:outgoing>
+      <bpmn:outgoing>F_digit</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_hash" name="#: check it" sourceRef="EndOfPin" targetRef="CheckPin">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">pinKey.digit = "#"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_digit" sourceRef="EndOfPin" targetRef="AddDigit"/>
+
+    <bpmn:serviceTask id="AddDigit" name="One more digit (FEEL)">
+      <bpmn:incoming>F_digit</bpmn:incoming><bpmn:outgoing>F_next_key</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>pinDigits + pinKey.digit</bpmn:from><bpmn:to>pinDigits</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <!-- THE DIGIT LOOP: back to the same wait for the next key. -->
+    <bpmn:sequenceFlow id="F_next_key" sourceRef="AddDigit" targetRef="PinWait"/>
+    <!-- Nothing more pressed: check what was entered (an empty entry finds nothing). -->
+    <bpmn:sequenceFlow id="F_pin_silence" sourceRef="PinSilence" targetRef="CheckPin"/>
+
+    <!-- `extension_pins` "<extension>:<digits>" — null when there is no such PIN. -->
+    <bpmn:serviceTask id="CheckPin" name="Look the PIN up">
+      <bpmn:incoming>F_hash</bpmn:incoming>
+      <bpmn:incoming>F_pin_silence</bpmn:incoming>
+      <bpmn:outgoing>F_looked_up</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrPin</bpmn:sourceRef>
+        <bpmn:targetRef>doPin</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_looked_up" sourceRef="CheckPin" targetRef="JudgePin"/>
+
+    <!-- The digits are dropped here: nothing after this point holds them. -->
+    <bpmn:serviceTask id="JudgePin" name="Is the PIN valid? (FEEL)">
+      <bpmn:incoming>F_looked_up</bpmn:incoming><bpmn:outgoing>F_judged</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>if pin = null then "wrong" else if pin.active != true then "inactive" else if pin.expiresAt != null and dateAndTime(pin.expiresAt) &lt;= now() then "expired" else "valid"</bpmn:from><bpmn:to>pinCheck</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>""</bpmn:from><bpmn:to>pinDigits</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>pinKey</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_judged" sourceRef="JudgePin" targetRef="PinValid"/>
+
+    <bpmn:exclusiveGateway id="PinValid" name="Valid?" default="F_pin_refused">
+      <bpmn:incoming>F_judged</bpmn:incoming>
+      <bpmn:outgoing>F_pin_ok</bpmn:outgoing>
+      <bpmn:outgoing>F_pin_refused</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_pin_ok" name="valid" sourceRef="PinValid" targetRef="PinAccess">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">pinCheck = "valid"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_pin_refused" name="wrong / inactive / expired" sourceRef="PinValid" targetRef="LogRefusal"/>
+
+    <bpmn:serviceTask id="PinAccess" name="The PIN holder may (FEEL)">
+      <bpmn:incoming>F_pin_ok</bpmn:incoming><bpmn:outgoing>F_pin_access</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"pin"</bpmn:from><bpmn:to>method</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>pin.note</bpmn:from><bpmn:to>note</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_pin_access" sourceRef="PinAccess" targetRef="PrepTransferring"/>
+
+    <!-- A refusal is logged with why — never with the digits. -->
+    <bpmn:serviceTask id="LogRefusal" name="Log the refused PIN">
+      <bpmn:incoming>F_pin_refused</bpmn:incoming><bpmn:outgoing>F_logged_refusal</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>logSeq + 1</bpmn:from><bpmn:to>logSeq</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, caller: caller, extension: extension, department: department, outcome: "pin-refused", reason: pinCheck, menuAttempts: menuAttempts, pinAttempts: pinAttempts, loggedAt: string(now())}</bpmn:from>
+          <bpmn:to>logEntry</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doLogEntry</bpmn:sourceRef>
+        <bpmn:targetRef>dsrLogRefusal</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_logged_refusal" sourceRef="LogRefusal" targetRef="PinAgain"/>
+
+    <bpmn:exclusiveGateway id="PinAgain" name="Another try?" default="F_pin_exhausted">
+      <bpmn:incoming>F_logged_refusal</bpmn:incoming>
+      <bpmn:outgoing>F_retry_pin</bpmn:outgoing>
+      <bpmn:outgoing>F_pin_exhausted</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_retry_pin" name="tries left" sourceRef="PinAgain" targetRef="PrepWrongPin">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">pinAttempts &lt; maxPinAttempts</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_pin_exhausted" sourceRef="PinAgain" targetRef="NoPin"/>
+
+    <bpmn:serviceTask id="PrepWrongPin" name="Wrong PIN (FEEL)">
+      <bpmn:incoming>F_retry_pin</bpmn:incoming><bpmn:outgoing>F_prep_wrong_pin</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, prompt: "ivr-dtmf/wrong-pin"}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_wrong_pin" sourceRef="PrepWrongPin" targetRef="PlayWrongPin"/>
+    <bpmn:serviceTask id="PlayWrongPin" name="Play &quot;that PIN is not valid&quot;" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_wrong_pin</bpmn:incoming><bpmn:outgoing>F_pin_again</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <!-- THE PIN LOOP: a fresh entry, back to the same wait. -->
+    <bpmn:sequenceFlow id="F_pin_again" sourceRef="PlayWrongPin" targetRef="PrepPin"/>
+
+    <bpmn:serviceTask id="NoPin" name="No valid PIN (FEEL)">
+      <bpmn:incoming>F_pin_exhausted</bpmn:incoming><bpmn:outgoing>F_no_pin</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"pin-attempts-exhausted"</bpmn:from><bpmn:to>giveUpReason</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_no_pin" sourceRef="NoPin" targetRef="PrepSorry"/>
+
+    <!-- ===================================================================== transfer -->
+
+    <bpmn:serviceTask id="PrepTransferring" name="Transferring you (FEEL)">
+      <bpmn:incoming>F_open_access</bpmn:incoming>
+      <bpmn:incoming>F_customer_access</bpmn:incoming>
+      <bpmn:incoming>F_pin_access</bpmn:incoming>
+      <bpmn:outgoing>F_prep_transferring</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, prompt: "ivr-dtmf/transferring"}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_transferring" sourceRef="PrepTransferring" targetRef="PlayTransferring"/>
+    <bpmn:serviceTask id="PlayTransferring" name="Play &quot;transferring you&quot;" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_transferring</bpmn:incoming><bpmn:outgoing>F_played_transferring</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_transferring" sourceRef="PlayTransferring" targetRef="PrepTransfer"/>
+
+    <bpmn:serviceTask id="PrepTransfer" name="Transfer request (FEEL)">
+      <bpmn:incoming>F_played_transferring</bpmn:incoming><bpmn:outgoing>F_prep_transfer</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <!-- The extension on the PBX the menu table chose: change `@pbx` to your PBX's domain. -->
+        <bpmn:assignment><bpmn:from>{callId: callId, target: "sip:" + extension + "@pbx"}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_transfer" sourceRef="PrepTransfer" targetRef="Transfer"/>
+
+    <!-- { callId, status: transferred | ended, target } — `ended` when the caller hung up first. -->
+    <bpmn:serviceTask id="Transfer" name="Transfer to the extension" implementation="channel:transfer">
+      <bpmn:extensionElements><q:timeout duration="PT30S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_transfer</bpmn:incoming><bpmn:outgoing>F_transferred</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>transfer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_transferred" sourceRef="Transfer" targetRef="LogTransfer"/>
+
+    <bpmn:serviceTask id="LogTransfer" name="Log the transfer">
+      <bpmn:incoming>F_transferred</bpmn:incoming><bpmn:outgoing>F_logged_transfer</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>logSeq + 1</bpmn:from><bpmn:to>logSeq</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, caller: caller, extension: extension, department: department, outcome: if transfer.status = "transferred" then "transferred" else "hung-up", method: method, reason: if transfer.status = "transferred" then null else "caller-hung-up", note: note, menuAttempts: menuAttempts, pinAttempts: pinAttempts, loggedAt: string(now())}</bpmn:from>
+          <bpmn:to>logEntry</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doLogEntry</bpmn:sourceRef>
+        <bpmn:targetRef>dsrLogTransfer</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_logged_transfer" sourceRef="LogTransfer" targetRef="AwaitEnd"/>
+
+    <!-- ===================================================================== giving up -->
+
+    <bpmn:serviceTask id="PrepSorry" name="Sorry, goodbye (FEEL)">
+      <bpmn:incoming>F_no_choice</bpmn:incoming>
+      <bpmn:incoming>F_no_pin</bpmn:incoming>
+      <bpmn:outgoing>F_prep_sorry</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, prompt: "ivr-dtmf/goodbye"}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_sorry" sourceRef="PrepSorry" targetRef="PlaySorry"/>
+    <bpmn:serviceTask id="PlaySorry" name="Play &quot;sorry, goodbye&quot;" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_sorry</bpmn:incoming><bpmn:outgoing>F_played_sorry</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_sorry" sourceRef="PlaySorry" targetRef="LogGaveUp"/>
+
+    <bpmn:serviceTask id="LogGaveUp" name="Log the call that gave up">
+      <bpmn:incoming>F_played_sorry</bpmn:incoming><bpmn:outgoing>F_logged_gave_up</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>logSeq + 1</bpmn:from><bpmn:to>logSeq</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, caller: caller, extension: extension, department: department, outcome: "gave-up", reason: giveUpReason, menuAttempts: menuAttempts, pinAttempts: pinAttempts, loggedAt: string(now())}</bpmn:from>
+          <bpmn:to>logEntry</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: callId, reason: "ivr-gave-up"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doLogEntry</bpmn:sourceRef>
+        <bpmn:targetRef>dsrLogGaveUp</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_logged_gave_up" sourceRef="LogGaveUp" targetRef="HangUp"/>
+
+    <bpmn:sendTask id="HangUp" name="Hang up">
+      <bpmn:extensionElements><q:send channel="hangup"/></bpmn:extensionElements>
+      <bpmn:incoming>F_logged_gave_up</bpmn:incoming><bpmn:outgoing>F_hung_up</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_hung_up" sourceRef="HangUp" targetRef="AwaitEnd"/>
+
+    <!-- ===================================================================== the end -->
+
+    <!-- A transfer and a hang-up both end the call for the engine; its `call-hangup` closes the
+         instance (and `session-end` frees the line). -->
+    <bpmn:eventBasedGateway id="AwaitEnd" name="Wait for the end of the call">
+      <bpmn:incoming>F_logged_transfer</bpmn:incoming>
+      <bpmn:incoming>F_hung_up</bpmn:incoming>
+      <bpmn:outgoing>F_to_call_over</bpmn:outgoing>
+      <bpmn:outgoing>F_to_linger</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_call_over" sourceRef="AwaitEnd" targetRef="CallOver"/>
+    <bpmn:sequenceFlow id="F_to_linger" sourceRef="AwaitEnd" targetRef="Linger"/>
+    <bpmn:intermediateCatchEvent id="CallOver" name="Call ended">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_call_over</bpmn:incoming><bpmn:outgoing>F_call_over</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="Linger" name="No end reported for 60 s">
+      <bpmn:incoming>F_to_linger</bpmn:incoming><bpmn:outgoing>F_linger</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT60S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_call_over" sourceRef="CallOver" targetRef="End"/>
+    <bpmn:sequenceFlow id="F_linger" sourceRef="Linger" targetRef="End"/>
+
+    <!-- The caller hung up while the menu or the PIN entry was waiting. -->
+    <bpmn:serviceTask id="PrepHungUp" name="Log the call that hung up">
+      <bpmn:incoming>F_menu_hangup</bpmn:incoming>
+      <bpmn:incoming>F_pin_hangup</bpmn:incoming>
+      <bpmn:outgoing>F_logged_hung_up</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>logSeq + 1</bpmn:from><bpmn:to>logSeq</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>""</bpmn:from><bpmn:to>pinDigits</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, caller: caller, extension: extension, department: department, outcome: "hung-up", reason: "caller-hung-up", menuAttempts: menuAttempts, pinAttempts: pinAttempts, loggedAt: string(now())}</bpmn:from>
+          <bpmn:to>logEntry</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doLogEntry</bpmn:sourceRef>
+        <bpmn:targetRef>dsrLogHungUp</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_logged_hung_up" sourceRef="PrepHungUp" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Call done">
+      <bpmn:incoming>F_call_over</bpmn:incoming>
+      <bpmn:incoming>F_linger</bpmn:incoming>
+      <bpmn:incoming>F_logged_hung_up</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

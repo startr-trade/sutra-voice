@@ -1,0 +1,38 @@
+[package]
+name = "sutra-voice-conformance"
+description = "Tests-only crate: the voice distribution's conformance suites (tier-1 variant lint, tier-2 docker end-to-end runs of the voice-assistant, ivr-dtmf, meeting-assistant and video-meeting-assistant examples) driven through the engine's sutra-testkit conformance harness."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Tests-only crate: the library is empty — every gate lives under `tests/all/` (one linked test
+# binary). The HARNESS lives in the engine's `sutra_testkit::conformance`; this crate carries
+# only the suites, their fixtures and their expectations.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# The atexit container reaper and — via the `conformance` feature — the harness:
+# `sutra_testkit::conformance::{util, engine, compose}`, re-exported by `tests/all/support.rs`.
+sutra-testkit = { workspace = true, features = ["conformance"] }
+# `assemble_dir` / `lint_dir_with_overlays` — each package sealed or linted on the host.
+sutra-loader = { workspace = true }
+# The schema-less formats the example packages bind (force-linked in tests/all.rs).
+sutra-formats = { workspace = true }
+# The meeting suites read each recording back from the object store and open the sealed object
+# with the key it was sealed under.
+sutra-objectstore = { workspace = true }
+sutra-crypto = { workspace = true }
+# Per-suite ad-hoc containers (rustpbx, SIPp, LiveKit, MinIO, the stub model).
+testcontainers = { workspace = true }
+serde_json = { workspace = true }
+# The voice suite compares the timestamps the flows store.
+time = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+# HTTP client for the engine intake (rustls, no OpenSSL).
+reqwest = { workspace = true }
+
+[[test]]
+name = "all"
+path = "tests/all.rs"

@@ -1,0 +1,22 @@
+# --- Rust build output ---
+/target/
+rust/target/
+**/*.rs.bk
+
+# --- Python bytecode caches (the stub model, dev scripts) ---
+__pycache__/
+*.pyc
+
+# --- Example run state: sealed archives written by `sutra package`, compose leftovers ---
+examples/*/deploy/deployments/*.sutra
+*.log
+
+# --- OpenTofu / Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# --- Editor / OS noise ---
+.idea/
+.vscode/
+.DS_Store

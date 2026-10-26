@@ -1,0 +1,99 @@
+# Channels for the voice-assistant module, 1.0.0 — the live variant: real model providers.
+# Everything but the two model channels is the same as the stub variant (see its comments for
+# the call channels and the `trunk-main` capacity pool). Keys are `env:` references resolved by
+# the engine when the package loads; an unset one fails the channel at load.
+#
+#   sutra package examples/voice-assistant/inbound/variants/inbound-live \
+#       --overlay examples/voice-assistant/inbound/shared --out examples/voice-assistant/deploy/deployments
+#
+# The responder must hear the caller's voice and speak: an OpenAI audio chat model (a model id
+# containing `audio`). The analysis must hear the customer's voice and answer in JSON: Gemini's
+# native API (audio understanding) first, the OpenAI audio model as the fallback.
+
+channels:
+  # ---- the call --------------------------------------------------------------------------------
+
+  - name: call-start
+    transport: voip
+    bind: "number:+15551230000"       # a list, a prefix (number:+1555123*) or number:* also work
+    codec: json
+    pool: trunk-main
+    pool-call-key: header.x-call-id   # one slot per call
+    session-end:
+      on-message: call-hangup         # the hang-up frees the line; the instance runs on
+    # Turn detection (energy VAD) for calls to this number.
+    silence-ms: 700                   # this much silence ends a turn
+    max-turn-ms: 30000                # a turn never runs longer
+    dead-air-ms: 2000                 # silences longer than this count as dead air
+
+  - name: call-turn
+    transport: voip
+    event: call-turn
+    codec: json                       # turn-body: json (the default) — the audio rides as base64 WAV
+
+  - name: call-dtmf
+    transport: voip
+    event: call-dtmf
+    codec: json
+
+  - name: call-hangup
+    transport: voip
+    event: call-hangup
+    codec: json
+
+  # ---- what the flow does to the call -----------------------------------------------------------
+
+  # Synchronous: the task completes when the audio has played (or the caller interrupted it).
+  # Body: { callId, audio: { data: <base64>, format: <media type> } } — a model's spoken answer as is.
+  - name: play
+    direction: outbound
+    transport: voip
+    bind: "voip://play"
+    ack-mode: on-complete
+
+  # { callId, target } — the target is an extension or SIP URI on the PBX.
+  - name: transfer
+    direction: outbound
+    transport: voip
+    bind: "voip://transfer"
+
+  # { callId, reason }
+  - name: hangup
+    direction: outbound
+    transport: voip
+    bind: "voip://hangup"
+
+  # ---- the models ---------------------------------------------------------------------------------
+
+  - name: voice-model
+    direction: outbound
+    transport: llm
+    bind: "llm://voice-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-audio
+          api-key: env:OPENAI_API_KEY
+      require: [audio-understanding]
+      output-voice: alloy
+      max-output-tokens: 200
+      timeout-seconds: 30
+
+  - name: analytics-model
+    direction: outbound
+    transport: llm
+    bind: "llm://analytics-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: gemini
+          model: gemini-2.5-flash
+          api-key: env:GEMINI_API_KEY
+        - provider: openai
+          model: gpt-audio
+          api-key: env:OPENAI_API_KEY
+      require: [audio-understanding, json-output]
+      fallback-on: [rate-limited, unavailable, timeout]
+      max-output-tokens: 800
+      timeout-seconds: 60

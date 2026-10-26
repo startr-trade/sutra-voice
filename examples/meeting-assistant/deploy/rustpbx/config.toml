@@ -1,0 +1,49 @@
+# rustpbx for the meeting-assistant example: the gateway between the engine and the conference's
+# SIP dial-in. Checked against rustpbx 0.5.1 (the image compose.yaml pins by digest); its
+# documentation and its source disagree in places, and this file follows the source.
+#
+# THE CALL PATH (outbound only). The engine sends call.originate over RWI (trunk `conference`) ->
+# the conference answers -> the engine transfers the call to its media WebSocket (the PCM bridge)
+# -> the engine sends the meeting PIN as DTMF over the bridge, which rustpbx sends on to the
+# conference as RFC 2833 telephone events. Media between rustpbx and the engine is linear PCM at
+# 8 kHz; rustpbx transcodes the leg to whatever it negotiated (G.711 here). rustpbx's media
+# bridge and recording are audio-only, so this example is audio-only.
+#
+# The tokens below are DEV-ONLY values that must match the engine's SUTRA_VOIP_RWI_TOKEN /
+# SUTRA_VOIP_MEDIA_TOKEN (compose.yaml). Replace both for anything beyond a local run.
+
+http_addr = "0.0.0.0:8080"
+database_url = "sqlite:///tmp/rustpbx.sqlite3"
+log_level = "info"
+
+# RTP: a small, explicit range. Publish exactly this range (UDP) when the conference provider's
+# media reaches the PBX from outside the Docker network, and set external_ip to the address the
+# provider sends media to.
+rtp_start_port = 20000
+rtp_end_port = 20019
+# external_ip = "203.0.113.10"
+
+[proxy]
+modules = ["acl", "call"]
+addr = "0.0.0.0"
+udp_port = 5060
+acl_rules = ["allow all"]
+media_proxy = "all"
+
+# THE TRUNK the bot dials out on. Here it is the stand-in conference (SIPp). With a real
+# conference service: dest = your SIP carrier (which reaches the conference's dial-in number) or
+# the conference platform's SIP endpoint, username/password = your digest credentials. `codec` is
+# required for calls the engine originates on a trunk (rustpbx builds the offer from it).
+[proxy.trunks.conference]
+dest = "sip:conference:5060"
+direction = "bidirectional"
+codec = ["pcmu", "pcma"]
+# username = "your-trunk-user"
+# password = "your-trunk-password"
+
+# Call control (originate, transfer to the media bridge, hang-up) — the engine's RWI client
+# connects here.
+[rwi]
+[[rwi.tokens]]
+token = "dev-only-rwi-token"
+scopes = ["call.control"]

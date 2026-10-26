@@ -1,0 +1,16 @@
+# sutra-voice workspace cargo config.
+#
+# The out-of-workspace harness seam. The engine's `sutra_testkit::conformance` resolves paths
+# from the tree IT was compiled from — which, across a submodule, is `engine/`, not this repo.
+# Two env vars re-anchor it:
+#
+#   SUTRA_REPO_ROOT    → the ENGINE tree (`repo_root()` locates engine-side infra and tools).
+#   SUTRA_EXAMPLES_DIR → THIS repo's `examples/`, the voice packages the suites assemble.
+#
+# Set HERE (as well as in the Makefile) so a bare `cargo test` anywhere in this workspace resolves
+# with no setup. `[env]` does not override a variable that is already set, so an explicit
+# `SUTRA_EXAMPLES_DIR=… cargo test` still wins. `relative = true` resolves each value against the
+# parent of this `.cargo` directory (`<repo>/rust`).
+[env]
+SUTRA_REPO_ROOT = { value = "../engine", relative = true }
+SUTRA_EXAMPLES_DIR = { value = "../examples", relative = true }

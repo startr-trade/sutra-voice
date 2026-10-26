@@ -1,0 +1,120 @@
+# Run the voice-assistant example locally: the engine, PostgreSQL, a stub model server, rustpbx as
+# the media gateway and SIPp as the stand-in carrier. Nothing to edit for the stub run.
+#
+#   sutra package examples/voice-assistant/inbound/variants/inbound-stub \
+#       --overlay examples/voice-assistant/inbound/shared --out examples/voice-assistant/deploy/deployments
+#   sutra package examples/voice-assistant/reminders/variants/reminders-stub \
+#       --overlay examples/voice-assistant/reminders/shared --out examples/voice-assistant/deploy/deployments
+#   docker compose -f examples/voice-assistant/deploy/compose.yaml up -d --build
+#
+#   # an inbound call: SIPp dials the assistant's number, speaks once, hangs up
+#   docker compose -f examples/voice-assistant/deploy/compose.yaml run --rm caller
+#   # a reminder call: the engine dials the carrier, which answers and speaks once
+#   curl -X POST -H 'X-Api-Key: dev-only-voice-key' -H 'Content-Type: application/json' \
+#        -d '{"appointmentId":"A-1","name":"Sam","phone":"+15550001111","when":"Tuesday at 10:00"}' \
+#        http://127.0.0.1:$(docker compose -f examples/voice-assistant/deploy/compose.yaml port engine 8080 | cut -d: -f2)/channels/reminder
+#
+# The project name is explicit so this stack never collides with one that would default to
+# `deploy`. Every name in here (engine, pbx, carrier, model-stub) is what the packages and
+# rustpbx/config.toml address.
+
+name: sutra-voice-assistant
+
+services:
+  engine:
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra-voice:0.6.0}
+    # PostgreSQL restarts once after its first-boot init scripts; an engine that connected in
+    # that window exits and is simply started again.
+    restart: on-failure
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+
+      # THE TRUNK'S LINES: one capacity pool shared by inbound and outbound calls (and by every
+      # package on this engine). Outbound can never take the last RESERVE_INBOUND lines.
+      SUTRA_CAPACITY_POOLS: trunk-main
+      SUTRA_CAPACITY_POOLS_TRUNK_MAIN_SLOTS: ${TRUNK_LINES:-4}
+      SUTRA_CAPACITY_POOLS_TRUNK_MAIN_RESERVE_INBOUND: ${TRUNK_INBOUND_RESERVE:-1}
+
+      # THE GATEWAY (the voip transport; engine-wide, one PBX per engine).
+      SUTRA_VOIP_GATEWAY: rustpbx
+      SUTRA_VOIP_RWI_URL: ws://pbx:8080/rwi/v1           # wss:// for a PBX behind TLS
+      SUTRA_VOIP_RWI_TOKEN: env:PBX_RWI_TOKEN            # references, never literals
+      SUTRA_VOIP_MEDIA_TOKEN: env:VOIP_MEDIA_TOKEN
+      SUTRA_VOIP_PUBLIC_MEDIA_URL: ws://engine:8080      # how the PBX reaches this engine
+      SUTRA_VOIP_TRUNK: carrier                          # the PBX trunk originated calls use
+      # Must match rustpbx/config.toml. Dev-only values: replace both outside a local run.
+      PBX_RWI_TOKEN: ${PBX_RWI_TOKEN:-dev-only-rwi-token}
+      VOIP_MEDIA_TOKEN: ${VOIP_MEDIA_TOKEN:-dev-only-media-token}
+
+      # What channels.yaml and datastores.yaml name by reference.
+      VOICE_API_KEY: ${VOICE_API_KEY:-dev-only-voice-key}
+      VOICE_DB_URL: postgres://engine-db:5432/sutra
+      VOICE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      VOICE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+      LLM_API_KEY: ${LLM_API_KEY:-stub-not-a-real-key}
+      # The live variants' keys; an `env:` reference to an unset variable fails the channel at
+      # load, so each is always defined. Export the real ones before `up`.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-not-set}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-not-set}
+    volumes:
+      - ${DEPLOYMENTS_DIR:-./deployments}:/deployments:ro
+    ports:
+      # Loopback only, dynamic by default (`docker compose … port engine 8080`).
+      - "127.0.0.1:${ENGINE_HOST_PORT:-}:8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+      model-stub:
+        condition: service_started
+      pbx:
+        condition: service_started
+
+  # The media gateway. Pinned BY DIGEST: the project publishes only a moving `latest` tag. This
+  # digest is rustpbx 0.5.1 (da5159a), the build the example and the engine's tests were run against.
+  pbx:
+    image: ghcr.io/restsend/rustpbx@sha256:c8c9258d27ed11d368fd94e3e9d47b5e0f03973b57106a00ece9fbbd4b5ea8b4
+    command: ["--conf", "/app/config.toml"]
+    volumes:
+      - ./rustpbx/config.toml:/app/config.toml:ro
+    # With a real trunk, publish SIP and exactly the RTP range of config.toml, e.g.
+    # ports: ["5060:5060/udp", "20000-20019:20000-20019/udp"]
+
+  # The stand-in carrier's trunk side: answers the calls the engine originates (up to 100).
+  carrier:
+    build: ./sipp
+    image: sutra-voice-sipp:dev
+    command: ["-sf", "/voice/carrier.xml", "-p", "5060", "-mp", "6000", "-m", "100", "-nostdin"]
+
+  # The stand-in carrier's caller: one inbound call per `docker compose run --rm caller`.
+  caller:
+    image: sutra-voice-sipp:dev
+    profiles: ["call"]
+    entrypoint: ["/voice/call.sh"]
+    command: ["pbx:5060"]
+    depends_on: [carrier]
+
+  model-stub:
+    image: python:3.12-alpine
+    command: ["python3", "/stub/model-stub.py", "8000"]
+    volumes:
+      - ../../model-stub:/stub:ro
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

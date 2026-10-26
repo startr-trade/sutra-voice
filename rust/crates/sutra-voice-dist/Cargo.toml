@@ -1,0 +1,80 @@
+[package]
+name = "sutra-voice-dist"
+description = "The deployable VOICE engine distribution — the composition root. Force-links the engine's default bundle (the schema-less formats, the vendor envref resolvers, the feature-selected transports and model providers, exactly as the engine's own sutra-dist does) PLUS the `voip` transport, then runs the domain-neutral sutra-engine library. Produces the `sutra-voice-engine` binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The neutral engine library, out of the `engine/` submodule. It names no codec and no
+# transport; everything below is bundled HERE, in the binary, exactly as the engine's own
+# `sutra-dist` does for the public set.
+sutra-engine = { workspace = true }
+# `--health-check`: the distroless runtime has no shell and no curl, so the image's Docker
+# HEALTHCHECK invokes this binary to probe its own readiness endpoint (rustls, no OpenSSL).
+reqwest = { workspace = true }
+
+# ---- the engine's default bundle -----------------------------------------------------------
+# Mirrors sutra-dist: the schema-less formats are the whole public codec set.
+sutra-formats = { workspace = true }
+# The `vault:` / `aws-secrets:` / `azure-kv:` / `gcp-secret:` secret-ref schemes, collected
+# generically by `ResolverRegistry::with_builtins()`. Always bundled, not feature-gated.
+sutra-envref-vault = { workspace = true }
+sutra-envref-aws = { workspace = true }
+sutra-envref-azure = { workspace = true }
+sutra-envref-gcp = { workspace = true }
+# Transports and model providers — OPTIONAL behind the same feature names sutra-dist uses, so a
+# voice image is a drop-in for a public one at the transport level.
+sutra-transport-http = { workspace = true, optional = true }
+sutra-transport-kafka = { workspace = true, optional = true }
+sutra-transport-sqs = { workspace = true, optional = true }
+sutra-transport-gcp-pubsub = { workspace = true, optional = true }
+sutra-transport-rabbitmq = { workspace = true, optional = true }
+sutra-transport-amqp = { workspace = true, optional = true }
+sutra-transport-file = { workspace = true, optional = true }
+sutra-transport-dapr = { workspace = true, optional = true }
+sutra-transport-knative = { workspace = true, optional = true }
+sutra-transport-llm = { workspace = true, optional = true }
+sutra-llm-openai = { workspace = true, optional = true }
+sutra-llm-anthropic = { workspace = true, optional = true }
+sutra-llm-bedrock = { workspace = true, optional = true }
+sutra-llm-gemini = { workspace = true, optional = true }
+
+# ---- this repository -----------------------------------------------------------------------
+# The `voip` transport (turn-based calls and meetings through a media gateway) — pure Rust, no
+# vendor SDK. Always linked: it is the reason this distribution exists.
+sutra-transport-voip = { path = "../sutra-transport-voip" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tracing = { workspace = true }
+
+# Same feature set and default as the engine's sutra-dist. The voice examples need `http`,
+# `llm` and its providers; the rest keeps the image general.
+[features]
+default = ["http", "kafka", "rabbitmq", "aws-sqs", "gcp-pubsub", "amqp", "file", "dapr", "knative", "llm-openai", "llm-anthropic", "llm-bedrock", "llm-gemini"]
+http = ["dep:sutra-transport-http"]
+kafka = ["dep:sutra-transport-kafka"]
+rabbitmq = ["dep:sutra-transport-rabbitmq"]
+aws-sqs = ["dep:sutra-transport-sqs"]
+gcp-pubsub = ["dep:sutra-transport-gcp-pubsub"]
+amqp = ["dep:sutra-transport-amqp"]
+file = ["dep:sutra-transport-file"]
+dapr = ["dep:sutra-transport-dapr"]
+knative = ["dep:sutra-transport-knative"]
+llm = ["dep:sutra-transport-llm"]
+llm-openai = ["llm", "dep:sutra-llm-openai"]
+llm-anthropic = ["llm", "dep:sutra-llm-anthropic"]
+llm-bedrock = ["llm", "dep:sutra-llm-bedrock"]
+llm-gemini = ["llm", "dep:sutra-llm-gemini"]
+
+[dev-dependencies]
+# The bundle-completeness tests resolve the assembled set through the SPI registries.
+sutra-llm-spi = { workspace = true }
+sutra-transport-spi = { workspace = true }
+
+# `sutra-voice-engine` — deliberately NOT `sutra-engine`, so an image or a manifest can never
+# silently swap a public engine for a voice one (or the reverse) on a matching entrypoint name.
+[[bin]]
+name = "sutra-voice-engine"
+path = "src/main.rs"

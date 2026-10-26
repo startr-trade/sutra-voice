@@ -1,0 +1,22 @@
+# Data stores of the voice-assistant module, 1.0.0 — referenced BY NAME from the BPMN
+# (<bpmn:dataStore name="interactions">).
+#
+# One store, two kinds of item:
+#   call:<callId>    the interaction record of one call — acoustic metrics, the model's analysis
+#                    of the customer's voice, the decided outcome (first-contact resolution,
+#                    repeat contact)
+#   caller:<number>  the caller's contact index — the last call, when it was, whether it was
+#                    resolved, how many calls so far; what the repeat-window lookup reads
+#
+# These records hold personal data (a phone number, an analysis of a person's voice). The
+# process tags them with GDPR data classes (q:audit in the BPMN), so subject erasure and
+# retention apply to them like any other personal data.
+datastores:
+  - name: interactions
+    type: sql
+    sql:
+      url-ref: env:VOICE_DB_URL
+      username-ref: env:VOICE_DB_USER
+      password-ref: env:VOICE_DB_PASSWORD
+      migrations: migrations/interactions
+    dataClass: personal

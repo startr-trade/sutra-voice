@@ -1,0 +1,10 @@
+# Deployment package labels — one standalone authoring unit once composed with ../../shared:
+#   sutra package <this dir> --overlay examples/meeting-assistant/shared
+# seals one content-addressed .sutra archive. Each variant holds its own copy of these labels; the
+# variants are alternative builds of one module — deploy one at a time.
+labels:
+  "module": "meeting-assistant"
+  "tenant": "default"
+  "version": "1.0.0"
+engine:
+  minContract: 1

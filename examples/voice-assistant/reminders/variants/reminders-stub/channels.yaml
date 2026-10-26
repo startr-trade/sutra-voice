@@ -1,0 +1,92 @@
+# Channels for the voice-reminders module, 1.0.0 — the stub variant: the model is the stub in
+# examples/model-stub, so the package runs with no key and no network. This is the variant
+# the engine's tier-2 tests deploy; the live variant differs only in the model channel.
+#
+#   sutra package examples/voice-assistant/reminders/variants/reminders-stub \
+#       --overlay examples/voice-assistant/reminders/shared --out examples/voice-assistant/deploy/deployments
+#
+# THE LINE. `originate` takes a slot of the engine's `trunk-main` capacity pool — the same pool
+# the inbound number uses (see ../../../inbound/variants/inbound-stub/channels.yaml) — before it dials, and
+# WAITS in the outbox while the trunk is full. The call's end (`call-hangup`) releases the slot
+# (`session-end` on the reminder channel), so a retry pause or the bookkeeping after a call never
+# holds a line.
+
+channels:
+  # ---- the hand-off -------------------------------------------------------------------------------
+
+  # { appointmentId, name, phone, when } — 202 at once; the call is made from here.
+  - name: reminder
+    transport: http
+    bind: "POST /channels/reminder"
+    codec: json
+    ack-mode: on-persist
+    cloudevents-mode: none
+    auth:
+      scheme: apikey
+      apikey:
+        value: env:VOICE_API_KEY
+        header: X-Api-Key
+    session-end:
+      on-message: call-hangup         # the end of a call frees its trunk slot
+
+  # ---- the call's events ------------------------------------------------------------------------
+
+  - name: call-progress
+    transport: voip
+    event: call-progress
+    codec: json
+    # Only the outcome of a call — not ringing / answered — so the flow waits once per attempt.
+    statuses: [connected, busy, no-answer, failed]
+
+  - name: call-turn
+    transport: voip
+    event: call-turn
+    codec: json
+    # Turn detection for the calls this module originates.
+    silence-ms: 700
+    max-turn-ms: 15000
+
+  - name: call-hangup
+    transport: voip
+    event: call-hangup
+    codec: json
+
+  # ---- what the flow does to the call -----------------------------------------------------------
+
+  # { callId, destination, callerId, timeoutSecs } — the flow names the call (callId) before it
+  # dials, so the call's events correlate from the first one.
+  - name: originate
+    direction: outbound
+    transport: voip
+    bind: "voip://originate"
+    pool: trunk-main
+    pool-call-key: header.x-call-id   # one slot per call; the retry of a call reuses its id
+
+  - name: play
+    direction: outbound
+    transport: voip
+    bind: "voip://play"
+    ack-mode: on-complete
+
+  - name: hangup
+    direction: outbound
+    transport: voip
+    bind: "voip://hangup"
+
+  # ---- the model ----------------------------------------------------------------------------------
+
+  - name: voice-model
+    direction: outbound
+    transport: llm
+    bind: "llm://voice-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-audio-voice-stub
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+      require: [audio-understanding]
+      output-voice: alloy
+      max-output-tokens: 200
+      timeout-seconds: 30

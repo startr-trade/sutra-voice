@@ -1,0 +1,5 @@
+# Codec manifest for the `meeting` schema. No channel binds it: its job is to be the row type of
+# the `transcripts` data store (datastores.yaml `structure.schema: urn:meeting`), which turns the
+# TranscriptSegment complexType in meeting.xsd into typed table columns.
+schemaKind: xsd
+formats: [xml]

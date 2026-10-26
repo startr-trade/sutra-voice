@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A VIDEO MEETING, END TO END. The WebRTC worker sits in the meeting room as a visible
+  participant and streams every other participant to the engine (tools/sutra-webrtc-worker); the
+  room arrives here as one session:
+
+    session-start (the worker opened the session: the first participant is in the room)
+      -> the consent announcement, SPOKEN in the room by the bot (recording and analysis)
+      -> ONE event-based gateway, looped: a participant joined or left (the roster),
+         the session ended (call-hangup), or a 4-hour limit (leave)
+      -> after the session: the record (participants, roles, who was analysed and why, talk time,
+         each participant's recording REFERENCE, the analysis digest) rendered as a report
+         (session-report.hbs) and stored (meetings, "session:<callId>").
+
+  THE MEDIA PLANE never passes through this flow. The `voip` transport records each participant's
+  audio (sealed, to the object store; the hang-up carries only the REFERENCES), transcribes each
+  participant's own track (transcript-segment.bpmn stores every segment) and analyses each segment
+  of each analysed participant from its audio and sampled camera frames (segment-analysis.bpmn
+  stores every answer). `<q:audit capture="media">` audits those references, never media.
+
+  WHO IS ANALYSED is decided by the `call-analysis` channel and enforced in the transport, before
+  any frame reaches a model: the role a participant was admitted with (a room-token attribute,
+  never inferred), `external` by default; staff only with an explicit opt-in (see the README: in
+  the EU, emotion recognition at work is prohibited). Analysis is advisory — for people to read.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_video_meeting"
+                  targetNamespace="urn:sutra:module:video-meeting-assistant:1.0.0">
+
+  <bpmn:dataStore id="meetingsStore" name="meetings"/>
+
+  <bpmn:process id="video-meeting" name="Sit in on, record and analyse a video meeting" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit capture="media"/>
+      <q:variables>
+        <q:variable name="callId" type="string"/>
+        <q:variable name="status" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doRecord" name="record"/>
+    <bpmn:dataStoreReference id="dsrRecord" name="meetings" dataStoreRef="meetingsStore">
+      <bpmn:extensionElements><q:store key="&quot;session:&quot; + callId"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- { callId, from, to, direction, format, gateway, session: "meeting", mode, recorded,
+         headers: {x-room} } -->
+    <bpmn:startEvent id="Start" name="The meeting started">
+      <bpmn:extensionElements>
+        <q:source channel="session-start" name="session" dataClass="pii"/>
+        <q:alias name="callKey" expression="getValue(header, &quot;x-call-id&quot;)" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="Init"/>
+
+    <bpmn:serviceTask id="Init" name="Prepare (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_init</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>session.callId</bpmn:from><bpmn:to>callId</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>if session.headers = null then null else getValue(session.headers, "x-room")</bpmn:from><bpmn:to>room</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>startedAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>[]</bpmn:from><bpmn:to>roster</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>"announcing"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: session.callId, prompt: "video-meeting-assistant/consent", consent: true}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_init" sourceRef="Init" targetRef="Announce"/>
+
+    <!-- The bot says it in the room: this meeting is recorded, transcribed and analysed. -->
+    <bpmn:serviceTask id="Announce" name="Announce recording and analysis" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_init</bpmn:incoming><bpmn:outgoing>F_announced</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_announced" sourceRef="Announce" targetRef="Listening"/>
+    <bpmn:serviceTask id="Listening" name="Listening (FEEL)">
+      <bpmn:incoming>F_announced</bpmn:incoming><bpmn:outgoing>F_listening</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"in-session"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_listening" sourceRef="Listening" targetRef="InMeeting"/>
+
+    <!-- ---- in the meeting: sparse events only ---- -->
+    <bpmn:eventBasedGateway id="InMeeting" name="In the meeting">
+      <bpmn:incoming>F_listening</bpmn:incoming>
+      <bpmn:incoming>F_noted</bpmn:incoming>
+      <bpmn:outgoing>F_to_participant</bpmn:outgoing>
+      <bpmn:outgoing>F_to_ended</bpmn:outgoing>
+      <bpmn:outgoing>F_to_too_long</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_participant" sourceRef="InMeeting" targetRef="Roster"/>
+    <bpmn:sequenceFlow id="F_to_ended" sourceRef="InMeeting" targetRef="SessionEnded"/>
+    <bpmn:sequenceFlow id="F_to_too_long" sourceRef="InMeeting" targetRef="TooLong"/>
+    <!-- { callId, event: joined|left, participantId, participantIndex, label, role, analysed,
+         analysisPolicy, atMs } -->
+    <bpmn:intermediateCatchEvent id="Roster" name="Someone joined or left">
+      <bpmn:extensionElements><q:source channel="call-participant" name="change" dataClass="pii"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_participant</bpmn:incoming><bpmn:outgoing>F_changed</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <!-- { callId, reason, durationMs, session: "meeting", consentAnnounced, participants: [...],
+         recordings: [<media reference>...], transcript, analysis, video, flaggedMoments } -->
+    <bpmn:intermediateCatchEvent id="SessionEnded" name="The meeting ended">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended" dataClass="pii"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_ended</bpmn:incoming><bpmn:outgoing>F_ended</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="TooLong" name="Four hours">
+      <bpmn:incoming>F_to_too_long</bpmn:incoming><bpmn:outgoing>F_too_long</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT4H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:serviceTask id="NoteChange" name="Note the change (FEEL)">
+      <bpmn:incoming>F_changed</bpmn:incoming><bpmn:outgoing>F_noted</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>append(roster, {event: change.event, participantIndex: change.participantIndex, role: change.role, analysed: change.analysed, atMs: change.atMs})</bpmn:from><bpmn:to>roster</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_changed" sourceRef="Roster" targetRef="NoteChange"/>
+    <!-- THE LOOP: back to the same wait. -->
+    <bpmn:sequenceFlow id="F_noted" sourceRef="NoteChange" targetRef="InMeeting"/>
+
+    <bpmn:serviceTask id="PrepLeave" name="Leave (FEEL)">
+      <bpmn:incoming>F_too_long</bpmn:incoming><bpmn:outgoing>F_prep_leave</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, reason: "time-limit"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_too_long" sourceRef="TooLong" targetRef="PrepLeave"/>
+    <bpmn:sequenceFlow id="F_prep_leave" sourceRef="PrepLeave" targetRef="Leave"/>
+    <bpmn:sendTask id="Leave" name="Leave the room">
+      <bpmn:extensionElements><q:send channel="hangup"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_leave</bpmn:incoming><bpmn:outgoing>F_left</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_left" sourceRef="Leave" targetRef="LeftEnded"/>
+    <bpmn:intermediateCatchEvent id="LeftEnded" name="Session ended">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended" dataClass="pii"/></bpmn:extensionElements>
+      <bpmn:incoming>F_left</bpmn:incoming><bpmn:outgoing>F_left_ended</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_ended" sourceRef="SessionEnded" targetRef="AfterSession"/>
+    <bpmn:sequenceFlow id="F_left_ended" sourceRef="LeftEnded" targetRef="AfterSession"/>
+
+    <!-- ---- after the session: the record and its report ---- -->
+    <bpmn:serviceTask id="AfterSession" name="The report's view (FEEL)">
+      <bpmn:incoming>F_ended</bpmn:incoming>
+      <bpmn:incoming>F_left_ended</bpmn:incoming>
+      <bpmn:outgoing>F_after</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"reported"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>endedAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>for p in (if ended.participants = null then [] else ended.participants) return {participantId: p.participantId, participantIndex: p.participantIndex, label: p.label, role: p.role, analysed: p.analysed, analysisPolicy: p.analysisPolicy, talkMs: p.talkMs, transcriptLines: p.transcriptLines, frames: p.video, segments: if p.analysis = null then 0 else p.analysis.segments, emotion: if p.analysis = null then null else p.analysis.dominantEmotion, engagement: if p.analysis = null then null else p.analysis.dominantEngagement, disagreements: if p.analysis = null then 0 else p.analysis.disagreements, recordingUri: if p.recording = null then null else p.recording.uri, recordingSha256: if p.recording = null then null else p.recording.sha256}</bpmn:from>
+          <bpmn:to>participants</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, room: room, startedAt: startedAt, endedAt: endedAt, durationMs: ended.durationMs, consentAnnounced: ended.consentAnnounced, participants: participants, analysis: ended.analysis, transcriptSegments: ended.transcript.segments, video: ended.video}</bpmn:from>
+          <bpmn:to>view</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_after" sourceRef="AfterSession" targetRef="Render"/>
+
+    <!-- The rendered text lands in `responseBody`. -->
+    <bpmn:serviceTask id="Render" name="Render the report" implementation="session-report.hbs">
+      <bpmn:incoming>F_after</bpmn:incoming><bpmn:outgoing>F_rendered</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_rendered" sourceRef="Render" targetRef="BuildRecord"/>
+
+    <bpmn:serviceTask id="BuildRecord" name="The record (FEEL)">
+      <bpmn:incoming>F_rendered</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, room: room, status: "reported", startedAt: startedAt, endedAt: endedAt, endReason: ended.reason, durationMs: ended.durationMs, consentAnnounced: ended.consentAnnounced, roster: roster, participants: participants, analysis: ended.analysis, transcript: ended.transcript, video: ended.video, flaggedMoments: ended.flaggedMoments, recordings: ended.recordings, report: responseBody}</bpmn:from>
+          <bpmn:to>record</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_built" sourceRef="BuildRecord" targetRef="SaveRecord"/>
+    <bpmn:serviceTask id="SaveRecord" name="Store the record">
+      <bpmn:incoming>F_built</bpmn:incoming><bpmn:outgoing>F_saved</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doRecord</bpmn:sourceRef>
+        <bpmn:targetRef>dsrRecord</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_saved" sourceRef="SaveRecord" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Reported"><bpmn:incoming>F_saved</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

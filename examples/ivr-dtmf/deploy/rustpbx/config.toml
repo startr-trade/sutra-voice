@@ -1,0 +1,86 @@
+# rustpbx for the ivr-dtmf example: the PBX in front of the menu, and the extensions the menu
+# transfers to. Checked against rustpbx 0.5.1 (the image compose.yaml pins by digest); its
+# documentation and its source disagree in places, and this file follows the source.
+#
+# THE CALL PATH.
+#   carrier -> trunk `carrier` -> the route below (the menu's number) -> the IVR "step" app, which
+#   asks the engine what to do (POST <engine>/voip/rustpbx/ivr-step) -> the engine answers "bridge
+#   the media to me" -> rustpbx dials the engine's media WebSocket, relaying the caller's keys
+#   (RFC 2833 telephone events) as DTMF frames. The webhook tap announces the call (call_created),
+#   and the engine takes control of it over RWI — which is how the menu transfers the call to an
+#   extension (call.transfer to sip:<extension>@pbx) or hangs it up.
+#
+# THE EXTENSIONS 200-203 register here (the `registrar` module) with the passwords below, and
+# the PBX finds them by their registration when the menu transfers a call.
+#
+# The tokens and passwords below are DEV-ONLY values; the two tokens must match the engine's
+# SUTRA_VOIP_RWI_TOKEN / SUTRA_VOIP_MEDIA_TOKEN (compose.yaml). Replace all of them for anything
+# beyond a local run.
+
+http_addr = "0.0.0.0:8080"
+database_url = "sqlite:///tmp/rustpbx.sqlite3"
+log_level = "info"
+
+# RTP: a small, explicit range. Publish exactly this range (UDP) when a real trunk or real phones
+# reach the PBX from outside the Docker network, and set external_ip to the address they send to.
+rtp_start_port = 20000
+rtp_end_port = 20019
+# external_ip = "203.0.113.10"
+
+[proxy]
+modules = ["acl", "auth", "registrar", "call"]
+addr = "0.0.0.0"
+udp_port = 5060
+# The stand-in carrier and phones sit on the same Docker network. With a real trunk, allow only
+# the carrier's signalling addresses and your phones' network here.
+acl_rules = ["allow all"]
+media_proxy = "all"
+# How long a phone's registration lasts (seconds) — the stand-in extensions register once.
+registrar_expires = 3600
+max_registrar_expires = 3600
+
+# The extensions. Each phone registers as its number with its password (SIP digest).
+[[proxy.user_backends]]
+type = "memory"
+users = [
+    { username = "200", password = "dev-only-ext-200" },
+    { username = "201", password = "dev-only-ext-201" },
+    { username = "202", password = "dev-only-ext-202" },
+    { username = "203", password = "dev-only-ext-203" },
+]
+
+# THE TRUNK. With a real carrier: dest = its SIP proxy, username/password = your digest
+# credentials, inbound_hosts = its signalling IPs (a trunk is recognised by SOURCE address),
+# did_numbers = your numbers.
+[proxy.trunks.carrier]
+dest = "sip:carrier:5060"
+direction = "bidirectional"
+inbound_hosts = ["172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
+did_numbers = ["15551239000"]
+codec = ["pcmu", "pcma"]
+# username = "your-trunk-user"
+# password = "your-trunk-password"
+
+# THE MENU'S NUMBER. Calls to it go to the IVR app in step mode, whose provider is the engine;
+# the engine answers every step with a media bridge to itself.
+[[proxy.routes]]
+name = "menu-number"
+priority = 10
+direction = "inbound"
+action = "application"
+app = "ivr"
+app_params = { mode = "step", url = "http://engine:8080/voip/rustpbx/ivr-step?token=dev-only-media-token" }
+auto_answer = true
+[proxy.routes.match]
+"to.user" = "^\\+?15551239000$"
+
+# Call control (attach, transfer, hang-up) — the engine's RWI client connects here.
+[rwi]
+[[rwi.tokens]]
+token = "dev-only-rwi-token"
+scopes = ["call.control"]
+
+# The event tap: how the engine learns of an inbound call.
+[rwi_webhook]
+url = "http://engine:8080/voip/rustpbx/webhook?token=dev-only-media-token"
+events = ["call_created", "call_hangup"]

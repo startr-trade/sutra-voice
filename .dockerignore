@@ -1,0 +1,30 @@
+# Build context trimming for `Dockerfile` (context = this repo root, because the build needs both
+# `rust/` and the `engine/` submodule side by side). Keep: rust/**, engine/rust/**.
+
+# Cargo build output, both trees.
+**/target/
+
+# VCS metadata.
+.git/
+engine/.git
+.gitmodules
+
+# Example packages, docs, the worker (its own image) — never baked into the engine image.
+examples/
+docs/
+tools/
+engine/examples/
+engine/docs/
+engine/deploy/
+engine/tools/
+*.md
+LICENSE-*
+
+# Tofu state, editor and OS noise.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.idea/
+.vscode/
+.claude/
+.DS_Store

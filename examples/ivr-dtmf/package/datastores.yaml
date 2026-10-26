@@ -1,0 +1,54 @@
+# Data stores of the ivr-dtmf module, 1.0.0 — referenced BY NAME from the BPMN
+# (<bpmn:dataStore name="customers">).
+#
+# All three are PROJECTED stores: `structure:` says "my rows ARE this XSD type"
+# (schemas/ivr/ivr.xsd), so each is a real table with one typed column per declared field, not
+# a key -> JSON blob. The DDL and the example data are the store's own migrations
+# (migrations/<store>/V001__*.sql), deployed with the BPMN. They re-run on every activation, so
+# they are idempotent: CREATE TABLE IF NOT EXISTS, and seed rows INSERT … ON CONFLICT DO NOTHING.
+#
+#   customers        keyed by phone number — a caller found here reaches the customers-only
+#                    extensions without a PIN
+#   extension_pins   keyed by "<extension>:<pin>" — who else may reach a customers-only
+#                    extension; each PIN has a note (who it was shared with), an active flag and
+#                    an optional expiry. CLEAR-TEXT PINS, DELIBERATELY, FOR THE EXAMPLE: see the
+#                    README for the risk and the production alternative.
+#   transfer_log     keyed by "<callId>/<n>" — every transfer, refused PIN, and call that gave up
+#                    or hung up. It never holds the digits the caller pressed.
+
+datastores:
+  - name: customers
+    type: sql
+    structure:
+      schema: urn:ivr          # the schemas/ivr codec in this package
+      type: Customer           # its complexType — one column per declared field
+    sql:
+      url-ref: env:IVR_DB_URL
+      username-ref: env:IVR_DB_USER
+      password-ref: env:IVR_DB_PASSWORD
+      migrations: migrations/customers
+    dataClass: personal        # phone numbers and names
+
+  - name: extension_pins
+    type: sql
+    structure:
+      schema: urn:ivr
+      type: ExtensionPin
+    sql:
+      url-ref: env:IVR_DB_URL
+      username-ref: env:IVR_DB_USER
+      password-ref: env:IVR_DB_PASSWORD
+      migrations: migrations/extension_pins
+    dataClass: credential
+
+  - name: transfer_log
+    type: sql
+    structure:
+      schema: urn:ivr
+      type: TransferLogEntry
+    sql:
+      url-ref: env:IVR_DB_URL
+      username-ref: env:IVR_DB_USER
+      password-ref: env:IVR_DB_PASSWORD
+      migrations: migrations/transfer_log
+    dataClass: personal        # caller numbers

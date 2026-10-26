@@ -1,0 +1,312 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AN APPOINTMENT-REMINDER CALL. One appointment arrives on `reminder` — from whatever schedules the
+  reminders (a nightly job, a booking system, a timer-started batch flow): it is handed over when
+  the call should be made. The flow dials the patient through the shared trunk, waits for the
+  outcome, and either holds a short conversation or tries again later.
+
+    reminder -> dial (voip://originate on the pooled `originate` channel)
+      -> OUTCOME (event-based gateway: the call's outcome on call-progress, or no news for 3 min)
+           connected (media is up)     -> CONVERSATION
+           busy / no-answer / failed   -> attempts left? pause, then dial AGAIN (a loop back to the
+                                          same wait, counted by `attempts`) : give up
+      CONVERSATION: remind -> listen (one answer, or silence) -> answer -> hang up -> call ended
+      -> record the outcome (data store, by appointment)
+
+  THE LINE. `originate` takes a slot of the engine's `trunk-main` capacity pool before it dials.
+  When the trunk is full the request WAITS in the outbox (oldest first) until a call ends, so a
+  batch of reminders paces itself to the trunk; the 3-minute "no news" arm bounds that wait. The
+  slot is released when the call ends (`session-end` on `call-hangup`), not when the instance
+  does.
+
+  The retry is a loop with a counter: every attempt re-enters the same dial and the same outcome
+  wait (a new wait each time, with its own timer); `maxAttempts` says how many.
+
+  CORRELATION. The flow names the call itself (`reminder-<appointmentId>`) before dialling, so
+  every progress, turn and hang-up of the call finds this instance through the start event's alias
+  (each voip message carries the id in `x-call-id`); a retry dials again under the same id.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_reminder_call"
+                  targetNamespace="urn:sutra:module:voice-reminders:1.0.0">
+
+  <bpmn:dataStore id="remindersStore" name="reminders"/>
+
+  <bpmn:process id="reminder-call" name="Call to remind of an appointment" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+      <q:variables>
+        <q:variable name="callId" type="string"/>
+        <q:variable name="attempts" type="number"/>
+        <q:variable name="outcome" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doRecord" name="record"/>
+    <bpmn:dataStoreReference id="dsrRecord" name="reminders" dataStoreRef="remindersStore">
+      <bpmn:extensionElements><q:store key="appointment.appointmentId"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- { appointmentId, name, phone, when } -->
+    <bpmn:startEvent id="Start" name="Reminder due">
+      <bpmn:extensionElements>
+        <q:source channel="reminder" name="appointment"/>
+        <q:alias name="callKey" expression="if getValue(header, &quot;x-call-id&quot;) = null then &quot;reminder-&quot; + appointment.appointmentId else getValue(header, &quot;x-call-id&quot;)" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="Init"/>
+
+    <bpmn:serviceTask id="Init" name="Prepare the call (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_init</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"reminder-" + appointment.appointmentId</bpmn:from><bpmn:to>callId</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>0</bpmn:from><bpmn:to>attempts</bpmn:to></bpmn:assignment>
+        <!-- How many times to dial before giving up. -->
+        <bpmn:assignment><bpmn:from>2</bpmn:from><bpmn:to>maxAttempts</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>"pending"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>answeredAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>reply</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>"You are the clinic's reminder assistant on a phone call. Keep every answer to one or two short spoken sentences. The call is recorded."</bpmn:from>
+          <bpmn:to>persona</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_init" sourceRef="Init" targetRef="PrepDial"/>
+
+    <!-- ---- an attempt: the loop's entry ---- -->
+    <bpmn:serviceTask id="PrepDial" name="Dial request (FEEL)">
+      <bpmn:incoming>F_init</bpmn:incoming>
+      <bpmn:incoming>F_retry</bpmn:incoming>
+      <bpmn:outgoing>F_prep_dial</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>attempts + 1</bpmn:from><bpmn:to>attempts</bpmn:to></bpmn:assignment>
+        <!-- A bare number is dialled through the gateway's trunk (SUTRA_VOIP_TRUNK). -->
+        <bpmn:assignment><bpmn:from>{callId: callId, destination: appointment.phone, callerId: "+15551230000", timeoutSecs: 30}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_dial" sourceRef="PrepDial" targetRef="Dial"/>
+    <!-- The `x-call-id` header is the pool's call key: one trunk slot per call. -->
+    <bpmn:sendTask id="Dial" name="Dial (waits for a free line)">
+      <bpmn:extensionElements>
+        <q:send channel="originate">
+          <q:header name="x-call-id" value="callId"/>
+        </q:send>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F_prep_dial</bpmn:incoming><bpmn:outgoing>F_dialled</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_dialled" sourceRef="Dial" targetRef="Outcome"/>
+    <!-- Re-entered on every attempt: each attempt is a new wait with its own 3-minute timer. -->
+    <bpmn:eventBasedGateway id="Outcome" name="Call outcome">
+      <bpmn:incoming>F_dialled</bpmn:incoming>
+      <bpmn:outgoing>F_to_progress</bpmn:outgoing>
+      <bpmn:outgoing>F_to_no_news</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_progress" sourceRef="Outcome" targetRef="Progressed"/>
+    <bpmn:sequenceFlow id="F_to_no_news" sourceRef="Outcome" targetRef="NoNews"/>
+    <!-- { callId, status: connected | busy | no-answer | failed } — the channel delivers only
+         outcomes (`statuses:` in channels.yaml), so one wait sees the result of the call. -->
+    <bpmn:intermediateCatchEvent id="Progressed" name="Outcome">
+      <bpmn:extensionElements><q:source channel="call-progress" name="progress"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_progress</bpmn:incoming><bpmn:outgoing>F_progress</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <!-- Also bounds the wait for a free line: the request waits in the outbox while the trunk is full. -->
+    <bpmn:intermediateCatchEvent id="NoNews" name="No news for 3 min">
+      <bpmn:incoming>F_to_no_news</bpmn:incoming><bpmn:outgoing>F_no_news</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT3M</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_progress" sourceRef="Progressed" targetRef="Connected"/>
+    <bpmn:sequenceFlow id="F_no_news" sourceRef="NoNews" targetRef="TryAgain"/>
+    <bpmn:exclusiveGateway id="Connected" name="Connected?" default="F_not_reached">
+      <bpmn:incoming>F_progress</bpmn:incoming>
+      <bpmn:outgoing>F_connected</bpmn:outgoing>
+      <bpmn:outgoing>F_not_reached</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_connected" name="connected" sourceRef="Connected" targetRef="PrepRemind">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">progress.status = "connected"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_not_reached" name="busy / no answer / failed" sourceRef="Connected" targetRef="TryAgain"/>
+    <!-- Not reached: another attempt while the counter allows. -->
+    <bpmn:exclusiveGateway id="TryAgain" name="Another attempt?" default="F_give_up">
+      <bpmn:incoming>F_no_news</bpmn:incoming>
+      <bpmn:incoming>F_not_reached</bpmn:incoming>
+      <bpmn:outgoing>F_attempts_left</bpmn:outgoing>
+      <bpmn:outgoing>F_give_up</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_attempts_left" name="attempts left" sourceRef="TryAgain" targetRef="RetryLater">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">attempts &lt; maxAttempts</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_give_up" sourceRef="TryAgain" targetRef="Unreachable"/>
+    <!-- A pause, then dial again. Short for the example; a real campaign waits longer (and keeps
+         to calling hours). -->
+    <bpmn:intermediateCatchEvent id="RetryLater" name="Pause before retrying">
+      <bpmn:incoming>F_attempts_left</bpmn:incoming>
+      <bpmn:outgoing>F_retry</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT10S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <!-- THE RETRY LOOP: back to the dial, and so to the same outcome wait. -->
+    <bpmn:sequenceFlow id="F_retry" sourceRef="RetryLater" targetRef="PrepDial"/>
+    <bpmn:serviceTask id="Unreachable" name="Not reached (FEEL)">
+      <bpmn:incoming>F_give_up</bpmn:incoming>
+      <bpmn:outgoing>F_unreachable</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"unreachable"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>endedAt</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_unreachable" sourceRef="Unreachable" targetRef="BuildRecord"/>
+
+    <!-- ---- the conversation ---- -->
+    <bpmn:serviceTask id="PrepRemind" name="The reminder (FEEL)">
+      <bpmn:incoming>F_connected</bpmn:incoming>
+      <bpmn:outgoing>F_prep_remind</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>answeredAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{system: persona, messages: [{role: "user", content: "The patient " + appointment.name + " has answered. Remind them of their appointment on " + appointment.when + ", and ask them to say yes to confirm or no to rearrange it."}], audioOutput: "audio/L16;rate=8000"}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_remind" sourceRef="PrepRemind" targetRef="Remind"/>
+    <bpmn:serviceTask id="Remind" name="Reminder (audio model)" implementation="channel:voice-model">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_remind</bpmn:incoming><bpmn:outgoing>F_remind</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_remind" sourceRef="Remind" targetRef="PrepPlayRemind"/>
+    <bpmn:serviceTask id="PrepPlayRemind" name="Speak it (FEEL)">
+      <bpmn:incoming>F_remind</bpmn:incoming><bpmn:outgoing>F_prep_play_remind</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>answer.transcript</bpmn:from><bpmn:to>said</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: callId, audio: answer.audio}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_play_remind" sourceRef="PrepPlayRemind" targetRef="PlayRemind"/>
+    <bpmn:serviceTask id="PlayRemind" name="Play the reminder" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT120S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_play_remind</bpmn:incoming><bpmn:outgoing>F_played_remind</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_remind" sourceRef="PlayRemind" targetRef="Listen"/>
+
+    <bpmn:eventBasedGateway id="Listen" name="Listen">
+      <bpmn:incoming>F_played_remind</bpmn:incoming>
+      <bpmn:outgoing>F_to_turn</bpmn:outgoing>
+      <bpmn:outgoing>F_to_gone</bpmn:outgoing>
+      <bpmn:outgoing>F_to_quiet</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_turn" sourceRef="Listen" targetRef="PatientSpoke"/>
+    <bpmn:sequenceFlow id="F_to_gone" sourceRef="Listen" targetRef="PatientHungUp"/>
+    <bpmn:sequenceFlow id="F_to_quiet" sourceRef="Listen" targetRef="Quiet"/>
+    <bpmn:intermediateCatchEvent id="PatientSpoke" name="Patient answered">
+      <bpmn:extensionElements><q:source channel="call-turn" name="turn"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_turn</bpmn:incoming><bpmn:outgoing>F_turn</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="PatientHungUp" name="Patient hung up">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_gone</bpmn:incoming><bpmn:outgoing>F_gone</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="Quiet" name="No answer for 20 s">
+      <bpmn:incoming>F_to_quiet</bpmn:incoming><bpmn:outgoing>F_quiet</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT20S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:serviceTask id="PrepReply" name="Answer the patient (FEEL)">
+      <bpmn:incoming>F_turn</bpmn:incoming><bpmn:outgoing>F_prep_reply</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{system: persona, messages: [{role: "assistant", content: said}, {role: "user", content: "The patient answers:", audio: turn.audio}, {role: "user", content: "Acknowledge their answer and say goodbye, in one or two sentences."}], audioOutput: "audio/L16;rate=8000"}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_turn" sourceRef="PatientSpoke" targetRef="PrepReply"/>
+    <bpmn:sequenceFlow id="F_prep_reply" sourceRef="PrepReply" targetRef="Reply"/>
+    <bpmn:serviceTask id="Reply" name="Answer (audio in, audio out)" implementation="channel:voice-model">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_reply</bpmn:incoming><bpmn:outgoing>F_replied</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_replied" sourceRef="Reply" targetRef="PrepPlayReply"/>
+    <bpmn:serviceTask id="PrepPlayReply" name="Speak it (FEEL)">
+      <bpmn:incoming>F_replied</bpmn:incoming><bpmn:outgoing>F_prep_play_reply</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>answer.transcript</bpmn:from><bpmn:to>reply</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: callId, audio: answer.audio}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_play_reply" sourceRef="PrepPlayReply" targetRef="PlayReply"/>
+    <bpmn:serviceTask id="PlayReply" name="Play the answer" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT120S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_play_reply</bpmn:incoming><bpmn:outgoing>F_played_reply</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_reply" sourceRef="PlayReply" targetRef="PrepHangup"/>
+    <bpmn:sequenceFlow id="F_quiet" sourceRef="Quiet" targetRef="PrepHangup"/>
+
+    <bpmn:serviceTask id="PrepHangup" name="Hang-up request (FEEL)">
+      <bpmn:incoming>F_played_reply</bpmn:incoming>
+      <bpmn:incoming>F_quiet</bpmn:incoming>
+      <bpmn:outgoing>F_prep_hangup</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, reason: "completed"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_hangup" sourceRef="PrepHangup" targetRef="HangUp"/>
+    <bpmn:sendTask id="HangUp" name="Hang up">
+      <bpmn:extensionElements><q:send channel="hangup"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_hangup</bpmn:incoming><bpmn:outgoing>F_hangup_sent</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_hangup_sent" sourceRef="HangUp" targetRef="CallEnded"/>
+    <bpmn:intermediateCatchEvent id="CallEnded" name="Call ended">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended"/></bpmn:extensionElements>
+      <bpmn:incoming>F_hangup_sent</bpmn:incoming><bpmn:outgoing>F_ended</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_ended" sourceRef="CallEnded" targetRef="Reached"/>
+    <bpmn:sequenceFlow id="F_gone" sourceRef="PatientHungUp" targetRef="Reached"/>
+
+    <bpmn:serviceTask id="Reached" name="Reached (FEEL)">
+      <bpmn:incoming>F_ended</bpmn:incoming>
+      <bpmn:incoming>F_gone</bpmn:incoming>
+      <bpmn:outgoing>F_reached</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>if reply = null then "reminded" else "answered"</bpmn:from><bpmn:to>outcome</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>endedAt</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_reached" sourceRef="Reached" targetRef="BuildRecord"/>
+
+    <bpmn:serviceTask id="BuildRecord" name="Build the record (FEEL)">
+      <bpmn:incoming>F_reached</bpmn:incoming>
+      <bpmn:incoming>F_unreachable</bpmn:incoming>
+      <bpmn:outgoing>F_built</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{appointmentId: appointment.appointmentId, callId: callId, attempts: attempts, outcome: outcome, answeredAt: answeredAt, endedAt: endedAt, patientReply: reply}</bpmn:from>
+          <bpmn:to>record</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_built" sourceRef="BuildRecord" targetRef="Save"/>
+    <bpmn:serviceTask id="Save" name="Store the outcome">
+      <bpmn:incoming>F_built</bpmn:incoming><bpmn:outgoing>F_saved</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doRecord</bpmn:sourceRef>
+        <bpmn:targetRef>dsrRecord</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_saved" sourceRef="Save" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Outcome recorded"><bpmn:incoming>F_saved</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

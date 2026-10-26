@@ -1,0 +1,35 @@
+# Data stores of the meeting-assistant module, 1.0.0 — referenced BY NAME from the BPMN
+# (<bpmn:dataStore name="transcripts">).
+#
+#   transcripts  PROJECTED (`structure:` — its rows ARE the TranscriptSegment type of
+#                schemas/meeting/meeting.xsd: a real table, one typed column per field), keyed by
+#                "<callId>:<seq>". One row per final transcript segment, written while the call
+#                is up. DDL in migrations/transcripts.
+#   meetings     key -> JSON. `report:<meetingId>` is a meeting's report (summary, decisions,
+#                action items, speakers, the acoustic metrics and the recording's reference);
+#                `schedule:<name>` is a standing meeting for scheduled-join to dial.
+#
+# Both hold personal data (what people said, who they are, an analysis of how they spoke). The
+# processes tag their messages with GDPR data classes, so subject erasure and retention apply to
+# them — and to the recordings they reference — like any other personal data.
+datastores:
+  - name: transcripts
+    type: sql
+    structure:
+      schema: urn:meeting      # the schemas/meeting codec in this package
+      type: TranscriptSegment
+    sql:
+      url-ref: env:MEETING_DB_URL
+      username-ref: env:MEETING_DB_USER
+      password-ref: env:MEETING_DB_PASSWORD
+      migrations: migrations/transcripts
+    dataClass: personal
+
+  - name: meetings
+    type: sql
+    sql:
+      url-ref: env:MEETING_DB_URL
+      username-ref: env:MEETING_DB_USER
+      password-ref: env:MEETING_DB_PASSWORD
+      migrations: migrations/meetings
+    dataClass: personal

@@ -1,0 +1,16 @@
+[package]
+name = "sutra-webrtc-core"
+description = "The pure-Rust half of the WebRTC media worker: the tagged media-frame header and the text frames of the media-stream protocol, secret references, the engine's sampling policy, the per-participant frame sampler, I420 to JPEG encoding, and the scripted participant's synthetic audio and video. No libwebrtc: it builds and tests anywhere."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Tests decode what the encoder wrote.
+jpeg-decoder = { version = "0.3", default-features = false }

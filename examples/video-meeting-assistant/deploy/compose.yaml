@@ -1,0 +1,165 @@
+# Run the video-meeting-assistant example locally: a LiveKit server (dev mode), the WebRTC media
+# worker sitting in the room, the engine, PostgreSQL, an S3-compatible object store (MinIO) for the
+# recordings and a stub model server. Nothing to edit for the stub run.
+#
+#   make worker-image                                   # sutra-webrtc-worker:dev (once)
+#   sutra package examples/video-meeting-assistant/variants/video-stub \
+#       --overlay examples/video-meeting-assistant/shared \
+#       --out examples/video-meeting-assistant/deploy/deployments
+#   docker compose -f examples/video-meeting-assistant/deploy/compose.yaml up -d
+#
+#   # a meeting with two scripted participants (synthetic camera + microphone), then read back
+#   # the session record (see the README):
+#   docker compose -f examples/video-meeting-assistant/deploy/compose.yaml --profile demo up -d
+#
+# Or join the room `standup` yourself from a LiveKit client (a token minted with the dev key, and
+# a `role` attribute — see the README). The project name is explicit so this stack never collides
+# with one that would default to `deploy`.
+
+name: sutra-video-meeting-assistant
+
+x-livekit-keys: &livekit-keys
+  LIVEKIT_URL: ws://livekit:7880
+  # References, never literals: the worker resolves env:/file: and refuses a literal value.
+  SUTRA_WORKER_API_KEY: env:LIVEKIT_API_KEY
+  SUTRA_WORKER_API_SECRET: env:LIVEKIT_API_SECRET
+  # LiveKit's dev-mode key pair. Replace both (and the server's keys) outside a local run.
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+
+services:
+  engine:
+    image: ${SUTRA_ENGINE_IMAGE:-ghcr.io/startr-trade/sutra-voice:0.6.0}
+    # PostgreSQL restarts once after its first-boot init scripts; an engine that connected in
+    # that window exits and is simply started again.
+    restart: on-failure
+    environment:
+      SUTRA_DEPLOYMENTS_DIR: /deployments
+      SUTRA_HTTP_PORT: "8080"
+      SUTRA_DATASOURCE_URL: postgres://engine-db:5432/sutra
+      SUTRA_DATASOURCE_USERNAME: ${ENGINE_DB_USER:-sutra_engine}
+      SUTRA_DATASOURCE_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+      # The durable audit of record (audit_event): the session's events carry the recordings'
+      # references (`<q:audit capture="media">`).
+      SUTRA_AUDIT_SQL: "true"
+
+      # THE MEDIA STREAM (the voip transport, gateway `generic`: the worker dials in, no PBX).
+      SUTRA_VOIP_MEDIA_TOKEN: env:VOIP_MEDIA_TOKEN
+      SUTRA_VOIP_PROMPTS_DIR: /prompts                   # the consent announcement
+      VOIP_MEDIA_TOKEN: ${VOIP_MEDIA_TOKEN:-dev-only-media-token}
+
+      # THE RECORDINGS: one per participant, sealed (envelope encryption) under the key below.
+      # Dev-only credentials and key: use secret: / vault: references in production.
+      SUTRA_VOIP_RECORDING_STORE: s3://meeting-recordings/sessions
+      SUTRA_VOIP_RECORDING_ENDPOINT: http://recordings:9000
+      SUTRA_VOIP_RECORDING_REGION: us-east-1
+      SUTRA_VOIP_RECORDING_ACCESS_KEY: env:RECORDINGS_ACCESS_KEY
+      SUTRA_VOIP_RECORDING_SECRET_KEY: env:RECORDINGS_SECRET_KEY
+      SUTRA_VOIP_RECORDING_KEK: env:RECORDINGS_KEK
+      SUTRA_VOIP_RECORDING_CREATE_BUCKET: "true"
+      RECORDINGS_ACCESS_KEY: ${RECORDINGS_ACCESS_KEY:-dev-only-access}
+      RECORDINGS_SECRET_KEY: ${RECORDINGS_SECRET_KEY:-dev-only-secret-key}
+      RECORDINGS_KEK: ${RECORDINGS_KEK:-dev-only-recordings-kek-change-me}
+
+      # What channels.yaml and datastores.yaml name by reference.
+      MEETING_DB_URL: postgres://engine-db:5432/sutra
+      MEETING_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      MEETING_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+      LLM_API_KEY: ${LLM_API_KEY:-stub-not-a-real-key}
+      # The live variant's keys; an `env:` reference to an unset variable fails the channel at
+      # load, so they are always defined. Export the real ones before `up`.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-not-set}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-not-set}
+    volumes:
+      - ${DEPLOYMENTS_DIR:-./deployments}:/deployments:ro
+      - ../prompts:/prompts/video-meeting-assistant:ro
+    ports:
+      # Loopback only, dynamic by default (`docker compose … port engine 8080`).
+      - "127.0.0.1:${ENGINE_HOST_PORT:-}:8080"
+    depends_on:
+      engine-db:
+        condition: service_healthy
+      recordings:
+        condition: service_started
+      model-stub:
+        condition: service_started
+
+  # LiveKit (Apache-2.0) in dev mode: the devkey/secret key pair, single node, no Redis (Redis is
+  # needed only for Egress, SIP or several nodes). Pinned by digest: v1.13.9.
+  livekit:
+    image: livekit/livekit-server@sha256:d0c04791bf63ca8dcea123571827d56ba9504bd57c8d5de60ee03b5408cc3154
+    command: ["--dev", "--bind", "0.0.0.0"]
+    ports:
+      # For a client on this machine: signalling, ICE over TCP, ICE over the UDP mux.
+      - "127.0.0.1:${LIVEKIT_HOST_PORT:-7880}:7880"
+      - "127.0.0.1:${LIVEKIT_TCP_PORT:-7881}:7881"
+      - "127.0.0.1:${LIVEKIT_UDP_PORT:-7882}:7882/udp"
+
+  # The bot. Sits in the room as a VISIBLE participant ("Meeting assistant (recording)") and
+  # streams every other participant to the engine; one session per meeting, then waits for the
+  # next one. Build it with `make worker-image`.
+  worker:
+    image: ${SUTRA_WORKER_IMAGE:-sutra-webrtc-worker:dev}
+    restart: on-failure
+    environment:
+      <<: *livekit-keys
+      SUTRA_WORKER_ROOM: ${MEETING_ROOM:-standup}
+      SUTRA_WORKER_ENGINE_URL: ws://engine:8080/voip/stream
+      SUTRA_WORKER_MEDIA_TOKEN: env:VOIP_MEDIA_TOKEN
+      VOIP_MEDIA_TOKEN: ${VOIP_MEDIA_TOKEN:-dev-only-media-token}
+      SUTRA_WORKER_CALLED: "+15550190000"               # what the session-start channel binds
+      SUTRA_WORKER_ROLE_ATTRIBUTE: role
+    depends_on:
+      - livekit
+      - engine
+
+  # ---- `--profile demo`: two scripted participants (a test and demo tool, not a client) -------
+  alex:
+    profiles: [demo]
+    image: ${SUTRA_WORKER_IMAGE:-sutra-webrtc-worker:dev}
+    entrypoint: ["sutra-webrtc-participant"]
+    command: ["--room", "${MEETING_ROOM:-standup}", "--identity", "alex", "--name", "Alex",
+              "--role", "staff", "--talk", "1.0-4.0,9.0-12.0", "--duration", "16",
+              "--tone", "160", "--color", "teal"]
+    environment: *livekit-keys
+    depends_on: [worker]
+  sam:
+    profiles: [demo]
+    image: ${SUTRA_WORKER_IMAGE:-sutra-webrtc-worker:dev}
+    entrypoint: ["sutra-webrtc-participant"]
+    command: ["--room", "${MEETING_ROOM:-standup}", "--identity", "sam", "--name", "Sam",
+              "--role", "external", "--talk", "4.5-8.0,12.5-15.0", "--duration", "16",
+              "--tone", "220", "--color", "orange"]
+    environment: *livekit-keys
+    depends_on: [worker]
+
+  # The recordings bucket: MinIO, as built by the community (upstream no longer publishes images);
+  # pinned by digest. Any S3-compatible store works — point SUTRA_VOIP_RECORDING_* at it.
+  recordings:
+    image: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${RECORDINGS_ACCESS_KEY:-dev-only-access}
+      MINIO_ROOT_PASSWORD: ${RECORDINGS_SECRET_KEY:-dev-only-secret-key}
+
+  model-stub:
+    image: python:3.12-alpine
+    command: ["python3", "/stub/model-stub.py", "8000"]
+    volumes:
+      - ../../model-stub:/stub:ro
+
+  engine-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sutra
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:-bootstrap-dev-only}
+      ENGINE_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
+      ENGINE_DB_PASSWORD: ${ENGINE_DB_PASSWORD:-sutra-dev-only}
+    volumes:
+      - ./engine-db-init.sh:/docker-entrypoint-initdb.d/10-engine-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sutra"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

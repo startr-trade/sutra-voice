@@ -1,0 +1,29 @@
+[package]
+name = "sutra-webrtc-worker"
+description = "The WebRTC media worker: joins a LiveKit room as a bot participant, subscribes to every participant's audio and video, and forwards them, attributed per participant, to the Sutra engine over the voip transport's media-stream WebSocket (audio frames plus video frames sampled at the engine's policy). Also ships sutra-webrtc-participant, a scripted participant for tests and demos."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sutra-webrtc-worker"
+path = "src/main.rs"
+
+[[bin]]
+name = "sutra-webrtc-participant"
+path = "src/bin/sutra-webrtc-participant.rs"
+
+[dependencies]
+sutra-webrtc-core = { path = "../sutra-webrtc-core" }
+# Pinned exactly: the SDK and libwebrtc move together, and libwebrtc's build needs the clang
+# the Dockerfile installs for this release.
+livekit = { version = "=0.9.7", default-features = false, features = ["native", "rustls-tls-native-roots"] }
+livekit-api = { version = "=0.9.1", default-features = false, features = ["access-token"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "tracing-log"] }
+serde_json = { workspace = true }

@@ -1,0 +1,4 @@
+# Sealed archives are BUILD OUTPUT: `sutra package examples/meeting-assistant/variants/<variant>
+# --overlay examples/meeting-assistant/shared` derives one, and dropping it here is what deploys
+# it. The directory itself is tracked so the compose bind mount resolves on a fresh clone.
+*.sutra

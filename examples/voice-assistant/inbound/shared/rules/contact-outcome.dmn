@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  What one call achieved — first-contact resolution and repeat contact. Interaction metrics are
+  the deployment's own definitions, not engine features: change the window or the rules here.
+
+  Inputs (process variables, set by the flow before this task):
+    hasPrior       boolean   the caller called before (a caller:<number> index exists)
+    daysSinceLast  number    whole days since that call; null when there was none
+    modelResolved  boolean   the analysis model judged the customer's issue resolved
+    transferred    boolean   the call was handed to a human agent
+
+  Outputs (merged back into the process variables):
+    outcome                  "first-contact-resolution" | "resolved-on-repeat" |
+                             "unresolved-repeat" | "transferred" | "unresolved"
+    resolved                 boolean
+    repeatContact            boolean   a call within the 7-day repeat window of the previous one
+    firstContactResolution   boolean   resolved, and not a repeat
+
+  The model's judgement is advisory: it is one input among several, and this table — the
+  deployment's rule — decides. Nothing here is an automated decision about the person.
+  FIRST hit policy: the first matching rule wins; "-" matches anything.
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20230324/MODEL/"
+             namespace="urn:sutra:module:voice-assistant:contact-outcome">
+  <decision id="contactOutcome" name="Contact outcome">
+    <decisionTable hitPolicy="FIRST">
+      <input id="i_prior"><inputExpression typeRef="boolean"><text>hasPrior</text></inputExpression></input>
+      <input id="i_days"><inputExpression typeRef="number"><text>daysSinceLast</text></inputExpression></input>
+      <input id="i_resolved"><inputExpression typeRef="boolean"><text>modelResolved</text></inputExpression></input>
+      <input id="i_transferred"><inputExpression typeRef="boolean"><text>transferred</text></inputExpression></input>
+      <output id="o_outcome" name="outcome" typeRef="string"/>
+      <output id="o_resolved" name="resolved" typeRef="boolean"/>
+      <output id="o_repeat" name="repeatContact" typeRef="boolean"/>
+      <output id="o_fcr" name="firstContactResolution" typeRef="boolean"/>
+      <rule id="r_transferred_repeat">
+        <inputEntry><text>true</text></inputEntry>
+        <inputEntry><text>&lt;= 7</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>true</text></inputEntry>
+        <outputEntry><text>"transferred"</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+      </rule>
+      <rule id="r_resolved_repeat">
+        <inputEntry><text>true</text></inputEntry>
+        <inputEntry><text>&lt;= 7</text></inputEntry>
+        <inputEntry><text>true</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"resolved-on-repeat"</text></outputEntry>
+        <outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+      </rule>
+      <rule id="r_unresolved_repeat">
+        <inputEntry><text>true</text></inputEntry>
+        <inputEntry><text>&lt;= 7</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"unresolved-repeat"</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+      </rule>
+      <rule id="r_transferred">
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>true</text></inputEntry>
+        <outputEntry><text>"transferred"</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+      </rule>
+      <rule id="r_fcr">
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>true</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"first-contact-resolution"</text></outputEntry>
+        <outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>true</text></outputEntry>
+      </rule>
+      <rule id="r_unresolved">
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>"unresolved"</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>false</text></outputEntry>
+      </rule>
+    </decisionTable>
+  </decision>
+</definitions>

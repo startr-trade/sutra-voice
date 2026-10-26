@@ -1,0 +1,73 @@
+# rustpbx for the voice-assistant example: the media gateway between the phone network and the
+# engine. Checked against rustpbx 0.5.1 (the image compose.yaml pins by digest); its documentation
+# and its source disagree in places, and this file follows the source.
+#
+# THE CALL PATH.
+#   inbound   carrier -> trunk `carrier` -> the route below (the DID) -> the IVR "step" app, which
+#             asks the engine what to do (POST <engine>/voip/rustpbx/ivr-step) -> the engine answers
+#             "bridge the media to me" -> rustpbx dials the engine's media WebSocket. The webhook
+#             tap announces the call (call_created), and the engine takes control of it over RWI.
+#   outbound  the engine sends call.originate over RWI (trunk `carrier`) -> answered -> the engine
+#             transfers the call to its media WebSocket.
+# Media between rustpbx and the engine is linear PCM at 8 kHz; rustpbx transcodes each leg to
+# whatever the leg negotiated (G.711 on the PSTN), so no telephony codec reaches the engine.
+#
+# The tokens below are DEV-ONLY values that must match the engine's SUTRA_VOIP_RWI_TOKEN /
+# SUTRA_VOIP_MEDIA_TOKEN (compose.yaml). Replace both for anything beyond a local run.
+
+http_addr = "0.0.0.0:8080"
+database_url = "sqlite:///tmp/rustpbx.sqlite3"
+log_level = "info"
+
+# RTP: a small, explicit range. Publish exactly this range (UDP) when a real trunk reaches the PBX
+# from outside the Docker network, and set external_ip to the address the carrier sends media to.
+rtp_start_port = 20000
+rtp_end_port = 20019
+# external_ip = "203.0.113.10"
+
+[proxy]
+modules = ["acl", "call"]
+addr = "0.0.0.0"
+udp_port = 5060
+# The stand-in carrier sits on the same Docker network. With a real trunk, allow only the
+# carrier's signalling addresses here.
+acl_rules = ["allow all"]
+media_proxy = "all"
+
+# THE TRUNK. With a real carrier: dest = its SIP proxy, username/password = your digest
+# credentials, inbound_hosts = its signalling IPs (a trunk is recognised by SOURCE address),
+# did_numbers = your numbers. `codec` is required for calls the engine originates on this trunk
+# (rustpbx builds the offer from it).
+[proxy.trunks.carrier]
+dest = "sip:carrier:5060"
+direction = "bidirectional"
+inbound_hosts = ["172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"]
+did_numbers = ["15551230000"]
+codec = ["pcmu", "pcma"]
+# username = "your-trunk-user"
+# password = "your-trunk-password"
+
+# THE NUMBER. Calls to the DID go to the IVR app in step mode, whose provider is the engine. The
+# engine answers every step with a media bridge to itself.
+[[proxy.routes]]
+name = "assistant-number"
+priority = 10
+direction = "inbound"
+action = "application"
+app = "ivr"
+app_params = { mode = "step", url = "http://engine:8080/voip/rustpbx/ivr-step?token=dev-only-media-token" }
+auto_answer = true
+[proxy.routes.match]
+"to.user" = "^\\+?15551230000$"
+
+# Call control (originate, attach, transfer, hang-up) — the engine's RWI client connects here.
+[rwi]
+[[rwi.tokens]]
+token = "dev-only-rwi-token"
+scopes = ["call.control"]
+
+# The event tap: how the engine learns of an inbound call (rustpbx announces no inbound call on
+# the RWI socket itself).
+[rwi_webhook]
+url = "http://engine:8080/voip/rustpbx/webhook?token=dev-only-media-token"
+events = ["call_created", "call_hangup"]

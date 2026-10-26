@@ -1,0 +1,126 @@
+name: CI
+
+# Pull-request / main-branch gate, modelled on the engine repository's ci.yml. It calls the
+# repo-root `make` targets (one source of truth — `make help` lists them), so a contributor who is
+# green locally is green here:
+#
+#   make fmt-check → cargo fmt --all --check
+#   make lint      → cargo clippy --workspace --all-targets -- -D warnings
+#   make test      → cargo test --workspace                      (tier-1, no Docker)
+#   make audit     → cargo audit + cargo deny check   (rust/deny.toml, rust/.cargo/audit.toml)
+#
+# Every job checks out the `engine/` submodule: the workspace's engine crates are path
+# dependencies into it, so without it nothing resolves.
+#
+# No Docker jobs: the tier-2 voice suites (`make test-docker`) run a PBX or an SFU, SIPp or the
+# WebRTC participant, the stub model and an object store per suite, and the WebRTC worker builds
+# against libwebrtc in its own Docker toolchain. Both stay local until a nightly workflow exists.
+# No release workflow yet either.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Debug info is the bulk of a debug build of the engine graph; a hosted runner's disk does not
+  # hold it (see the engine's ci.yml). Panics still name the failing test.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The submodule too: `cargo fmt --all` reads the workspace metadata, which resolves the
+      # engine path dependencies.
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: make fmt-check
+        run: make fmt-check
+
+  lint:
+    name: clippy (make lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: lint
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      # librdkafka (the engine's Kafka transport, in the default bundle) vendors its C sources;
+      # `make` + a C++ compiler are the only extra tools it needs. ubuntu-latest ships both.
+      - name: Verify C/C++ build tooling (librdkafka vendored build)
+        run: |
+          command -v make >/dev/null || { echo "::error::make is missing"; exit 1; }
+          command -v g++  >/dev/null || { echo "::error::g++ is missing";  exit 1; }
+      - name: make lint
+        run: make lint
+
+  test:
+    name: tier-1 tests (make test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: test
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - name: make test
+        run: make test
+
+  audit:
+    name: supply chain (make audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: make audit
+        run: make audit

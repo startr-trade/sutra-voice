@@ -1,0 +1,463 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A CALL TO THE ASSISTANT'S NUMBER, AND WHAT IT ACHIEVED.
+
+  The voip transport hands the call to the engine as messages, each carrying the call's id in the
+  `x-call-id` header. This process IS the call — one instance from the greeting to the post-call
+  analysis. It starts on `call-start`; every later message of the call (each utterance, each key,
+  the hang-up) finds it through the start event's alias. The conversation is a LOOP back to one
+  wait, which the instance re-enters after every answer:
+
+    call-start -> greet (audio model) -> play
+      -> IN THE CALL (event-based gateway, re-entered every time round the loop):
+           the caller spoke (`call-turn`)  -> the utterance, AS AUDIO, to an audio-native model
+                                              with the conversation so far -> remember the turn ->
+                                              play the answer -> the model handed over? transfer
+                                              -> back IN THE CALL
+           a key (`call-dtmf`)             -> 0: transfer to an agent; #: goodbye and hang up;
+                                              any other key: nothing -> back IN THE CALL
+           2 minutes of nothing            -> hang up -> back IN THE CALL (the hang-up arrives)
+           the call ended (`call-hangup`)  -> POST-CALL
+      -> POST-CALL. The line is already free: `session-end` released the call's slot on the
+         hang-up, while this instance carries on: analyse the customer's voice over the call (an
+         audio-understanding model, structured JSON) -> look up the caller's previous contact
+         (data store, by caller number) -> DMN decides the outcome (first-contact resolution,
+         repeat contact) -> store the interaction record (and, on a repeat, mark the previous call
+         as not resolved at first contact)
+
+  The conversation lives in the instance's own variables (`history`: what was said; `turns`:
+  each utterance's audio and acoustic features, for the analysis) — nothing is passed through a
+  data store between turns. The transport delivers a call's messages strictly in order, one at a
+  time, and holds the next one while the instance is still answering the last, so a turn spoken
+  over an answer is answered next, never lost.
+
+  CONSENT. The greeting states that the call is recorded and analysed. Analysis covers the
+  CUSTOMER only (`analyzedParties`): an agent's leg never reaches the engine — a transfer hands the
+  call to the PBX — and agent-side emotion analysis is opt-in only (see the README: inferring the
+  emotions of people at work is prohibited in the EU). The analysis is advisory data for people and
+  for the outcome table, never an automated decision about the caller.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_inbound_call"
+                  targetNamespace="urn:sutra:module:voice-assistant:1.0.0">
+
+  <bpmn:dataStore id="interactionsStore" name="interactions"/>
+
+  <bpmn:process id="inbound-call" name="Answer a call, then record what it achieved" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+      <q:variables>
+        <q:variable name="callId" type="string"/>
+        <q:variable name="caller" type="string" sensitive="true" subjectKey="true"/>
+        <q:variable name="transferred" type="boolean"/>
+        <q:variable name="handOver" type="boolean"/>
+        <q:variable name="hasPrior" type="boolean"/>
+        <q:variable name="modelResolved" type="boolean"/>
+        <!-- The caller's own audio, turn by turn: personal data, redacted wherever it is logged. -->
+        <q:variable name="turns" sensitive="true"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <!-- The kinds of item in the `interactions` store (see datastores.yaml). -->
+    <bpmn:dataObject id="doPrior" name="prior"/>
+    <bpmn:dataObject id="doRecord" name="record"/>
+    <bpmn:dataObject id="doCallerIndex" name="callerIndex"/>
+    <bpmn:dataObject id="doPriorFcr" name="priorFcr"/>
+    <bpmn:dataStoreReference id="dsrCallerRead" name="interactions" dataStoreRef="interactionsStore">
+      <bpmn:extensionElements><q:store key="&quot;caller:&quot; + caller"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrCallerWrite" name="interactions" dataStoreRef="interactionsStore">
+      <bpmn:extensionElements><q:store key="&quot;caller:&quot; + caller"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrRecord" name="interactions" dataStoreRef="interactionsStore">
+      <bpmn:extensionElements><q:store key="&quot;call:&quot; + callId"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrPriorFcr" name="interactions" dataStoreRef="interactionsStore">
+      <bpmn:extensionElements><q:store key="&quot;call:&quot; + prior.lastCallId" field="firstContactResolution"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- ===================================================================== the call -->
+
+    <!-- { callId, from, to, direction, format, gateway } -->
+    <bpmn:startEvent id="Start" name="Call to the number">
+      <bpmn:extensionElements>
+        <q:source channel="call-start" name="call"/>
+        <q:alias name="callKey" expression="getValue(header, &quot;x-call-id&quot;)" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="Init"/>
+
+    <bpmn:serviceTask id="Init" name="Prepare the greeting (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_init</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>call.callId</bpmn:from><bpmn:to>callId</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>if call.from = null then "unknown" else call.from</bpmn:from><bpmn:to>caller</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>startedAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>prior</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>[]</bpmn:from><bpmn:to>turns</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>transferred</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>key</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>"You are the voice assistant of a clinic's front desk, answering the phone. Keep every answer to one or two short spoken sentences. If the caller asks for a person, or you cannot help, say exactly: Transferring you to an agent now."</bpmn:from><bpmn:to>persona</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{system: persona, messages: [{role: "user", content: "A caller has just been connected. Greet them in one sentence, say that this call is recorded and analysed to help us serve them, and ask how you can help."}], audioOutput: "audio/L16;rate=8000"}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_init" sourceRef="Init" targetRef="Greet"/>
+
+    <bpmn:serviceTask id="Greet" name="Greeting (audio model)" implementation="channel:voice-model">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_init</bpmn:incoming><bpmn:outgoing>F_greet</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_greet" sourceRef="Greet" targetRef="PrepGreeting"/>
+
+    <!-- The conversation so far: the model's own words, and a marker per caller turn. -->
+    <bpmn:serviceTask id="PrepGreeting" name="Start the conversation (FEEL)">
+      <bpmn:incoming>F_greet</bpmn:incoming><bpmn:outgoing>F_prep_greeting</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>[{role: "assistant", content: answer.transcript}]</bpmn:from><bpmn:to>history</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: callId, audio: answer.audio}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_greeting" sourceRef="PrepGreeting" targetRef="PlayGreeting"/>
+
+    <!-- `play` is synchronous: the task completes when the audio has been played (or the caller
+         interrupted it by speaking). -->
+    <bpmn:serviceTask id="PlayGreeting" name="Play the greeting" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT120S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_greeting</bpmn:incoming><bpmn:outgoing>F_played_greeting</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_greeting" sourceRef="PlayGreeting" targetRef="InCall"/>
+
+    <!-- THE LOOP'S WAIT. Every pass through the conversation comes back here, and each pass is a
+         new wait: its own idle timer, its own correlation. -->
+    <bpmn:eventBasedGateway id="InCall" name="In the call">
+      <bpmn:incoming>F_played_greeting</bpmn:incoming>
+      <bpmn:incoming>F_next_turn</bpmn:incoming>
+      <bpmn:incoming>F_after_transfer</bpmn:incoming>
+      <bpmn:incoming>F_other_key</bpmn:incoming>
+      <bpmn:incoming>F_hung_up</bpmn:incoming>
+      <bpmn:outgoing>F_to_turn</bpmn:outgoing>
+      <bpmn:outgoing>F_to_key</bpmn:outgoing>
+      <bpmn:outgoing>F_to_hangup</bpmn:outgoing>
+      <bpmn:outgoing>F_to_idle</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_turn" sourceRef="InCall" targetRef="CallerSpoke"/>
+    <bpmn:sequenceFlow id="F_to_key" sourceRef="InCall" targetRef="KeyPressed"/>
+    <bpmn:sequenceFlow id="F_to_hangup" sourceRef="InCall" targetRef="CallEnded"/>
+    <bpmn:sequenceFlow id="F_to_idle" sourceRef="InCall" targetRef="Idle"/>
+
+    <!-- { callId, turnIndex, endReason, bargeIn, audio: { data: <base64 WAV>, format }, features }
+         — one utterance, cut by the transport's turn detector. -->
+    <bpmn:intermediateCatchEvent id="CallerSpoke" name="The caller spoke">
+      <bpmn:extensionElements><q:source channel="call-turn" name="turn"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_turn</bpmn:incoming><bpmn:outgoing>F_turn</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <!-- { callId, digit } — the fallback when speech is not working. -->
+    <bpmn:intermediateCatchEvent id="KeyPressed" name="A key">
+      <bpmn:extensionElements><q:source channel="call-dtmf" name="key"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_key</bpmn:incoming><bpmn:outgoing>F_key</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <!-- { callId, reason, hangupBy, sipStatus, durationMs, features }: features = the call-level
+         acoustic metrics the transport measured (talk time and ratio, silence, dead air,
+         interruptions, overtalk, speech rate, pitch and energy) — no model involved. A hand-over
+         to an agent ends the call for the engine too (reason "transferred"). -->
+    <bpmn:intermediateCatchEvent id="CallEnded" name="Call ended">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_hangup</bpmn:incoming><bpmn:outgoing>F_ended</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="Idle" name="2 minutes of nothing">
+      <bpmn:incoming>F_to_idle</bpmn:incoming><bpmn:outgoing>F_idle</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT2M</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+
+    <!-- ---- the caller spoke ---- -->
+
+    <bpmn:serviceTask id="PrepTurn" name="Hand the utterance to the model (FEEL)">
+      <bpmn:incoming>F_turn</bpmn:incoming><bpmn:outgoing>F_prep_turn</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{system: persona, messages: append(history, {role: "user", content: "The caller says:", audio: turn.audio}), audioOutput: "audio/L16;rate=8000"}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_turn" sourceRef="CallerSpoke" targetRef="PrepTurn"/>
+    <bpmn:sequenceFlow id="F_prep_turn" sourceRef="PrepTurn" targetRef="Respond"/>
+
+    <bpmn:serviceTask id="Respond" name="Answer (audio in, audio out)" implementation="channel:voice-model">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_turn</bpmn:incoming><bpmn:outgoing>F_respond</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_respond" sourceRef="Respond" targetRef="Remember"/>
+
+    <!-- The history keeps the model's own words and a marker per caller turn: the caller's audio
+         is sent once, with its own turn, not again on every later turn. `turns` keeps each
+         utterance (audio and features) for the post-call analysis. -->
+    <bpmn:serviceTask id="Remember" name="Remember the turn (FEEL)">
+      <bpmn:incoming>F_respond</bpmn:incoming><bpmn:outgoing>F_remembered</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>answer.transcript != null and contains(lowerCase(answer.transcript), "transferring you to an agent")</bpmn:from><bpmn:to>handOver</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>concatenate(history, [{role: "user", content: "(the caller spoke: turn " + string(turn.turnIndex) + ")"}, {role: "assistant", content: answer.transcript}])</bpmn:from><bpmn:to>history</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>append(turns, {index: turn.turnIndex, audio: turn.audio, features: turn.features, bargeIn: turn.bargeIn})</bpmn:from><bpmn:to>turns</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: callId, audio: answer.audio}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_remembered" sourceRef="Remember" targetRef="PlayAnswer"/>
+
+    <!-- Synchronous: done when the audio has played, so a hand-over never cuts its own
+         announcement short. -->
+    <bpmn:serviceTask id="PlayAnswer" name="Play the answer" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT120S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_remembered</bpmn:incoming><bpmn:outgoing>F_played</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played" sourceRef="PlayAnswer" targetRef="HandOver"/>
+
+    <bpmn:exclusiveGateway id="HandOver" name="Handing over?" default="F_next_turn">
+      <bpmn:incoming>F_played</bpmn:incoming>
+      <bpmn:outgoing>F_agent</bpmn:outgoing>
+      <bpmn:outgoing>F_next_turn</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_agent" name="the model hands over" sourceRef="HandOver" targetRef="PrepTransfer">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">handOver = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <!-- THE LOOP: back to the same wait for the caller's next utterance. -->
+    <bpmn:sequenceFlow id="F_next_turn" name="next turn" sourceRef="HandOver" targetRef="InCall"/>
+
+    <!-- ---- a key ---- -->
+
+    <bpmn:exclusiveGateway id="WhichKey" name="Which key?" default="F_other_key">
+      <bpmn:incoming>F_key</bpmn:incoming>
+      <bpmn:outgoing>F_key_agent</bpmn:outgoing>
+      <bpmn:outgoing>F_key_bye</bpmn:outgoing>
+      <bpmn:outgoing>F_other_key</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_key" sourceRef="KeyPressed" targetRef="WhichKey"/>
+    <bpmn:sequenceFlow id="F_key_agent" name="0: an agent" sourceRef="WhichKey" targetRef="PrepTransfer">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">key.digit = "0"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_key_bye" name="#: goodbye" sourceRef="WhichKey" targetRef="PrepGoodbye"/>
+    <bpmn:sequenceFlow id="F_other_key" name="any other key" sourceRef="WhichKey" targetRef="InCall"/>
+
+    <!-- ---- the hand-over: the model said so, or the caller pressed 0 ---- -->
+
+    <bpmn:serviceTask id="PrepTransfer" name="Transfer request (FEEL)">
+      <bpmn:incoming>F_agent</bpmn:incoming>
+      <bpmn:incoming>F_key_agent</bpmn:incoming>
+      <bpmn:outgoing>F_prep_transfer</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>true</bpmn:from><bpmn:to>transferred</bpmn:to></bpmn:assignment>
+        <!-- The agents' extension (or queue) on the PBX: change it to yours. -->
+        <bpmn:assignment><bpmn:from>{callId: callId, target: "sip:2001@pbx"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_transfer" sourceRef="PrepTransfer" targetRef="Transfer"/>
+    <bpmn:sendTask id="Transfer" name="Transfer to an agent">
+      <bpmn:extensionElements><q:send channel="transfer"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_transfer</bpmn:incoming><bpmn:outgoing>F_after_transfer</bpmn:outgoing>
+    </bpmn:sendTask>
+    <!-- The transfer ends the call for the engine: its `call-hangup` arrives at the same wait. -->
+    <bpmn:sequenceFlow id="F_after_transfer" sourceRef="Transfer" targetRef="InCall"/>
+
+    <!-- ---- goodbye: the caller pressed #, or 2 minutes of nothing ---- -->
+
+    <bpmn:serviceTask id="PrepGoodbye" name="Say goodbye (FEEL)">
+      <bpmn:incoming>F_key_bye</bpmn:incoming><bpmn:outgoing>F_prep_goodbye</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{system: persona, messages: append(history, {role: "user", content: "The caller pressed the key to end the call. Say goodbye in one short sentence."}), audioOutput: "audio/L16;rate=8000"}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_goodbye" sourceRef="PrepGoodbye" targetRef="Goodbye"/>
+    <bpmn:serviceTask id="Goodbye" name="Goodbye (audio model)" implementation="channel:voice-model">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_goodbye</bpmn:incoming><bpmn:outgoing>F_goodbye</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_goodbye" sourceRef="Goodbye" targetRef="PrepPlayGoodbye"/>
+    <bpmn:serviceTask id="PrepPlayGoodbye" name="Speak it (FEEL)">
+      <bpmn:incoming>F_goodbye</bpmn:incoming><bpmn:outgoing>F_prep_play_goodbye</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, audio: answer.audio}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_play_goodbye" sourceRef="PrepPlayGoodbye" targetRef="PlayGoodbye"/>
+    <bpmn:serviceTask id="PlayGoodbye" name="Play the goodbye" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT120S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_play_goodbye</bpmn:incoming><bpmn:outgoing>F_played_goodbye</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_played_goodbye" sourceRef="PlayGoodbye" targetRef="PrepHangup"/>
+    <bpmn:sequenceFlow id="F_idle" sourceRef="Idle" targetRef="PrepHangup"/>
+
+    <bpmn:serviceTask id="PrepHangup" name="Hang-up request (FEEL)">
+      <bpmn:incoming>F_played_goodbye</bpmn:incoming>
+      <bpmn:incoming>F_idle</bpmn:incoming>
+      <bpmn:outgoing>F_prep_hangup</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, reason: if key != null and key.digit = "#" then "caller-ended" else "idle"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_hangup" sourceRef="PrepHangup" targetRef="HangUp"/>
+    <bpmn:sendTask id="HangUp" name="Hang up">
+      <bpmn:extensionElements><q:send channel="hangup"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_hangup</bpmn:incoming><bpmn:outgoing>F_hung_up</bpmn:outgoing>
+    </bpmn:sendTask>
+    <!-- The hang-up's `call-hangup` arrives at the same wait, which then leaves the loop. -->
+    <bpmn:sequenceFlow id="F_hung_up" sourceRef="HangUp" targetRef="InCall"/>
+    <bpmn:sequenceFlow id="F_ended" sourceRef="CallEnded" targetRef="PostCall"/>
+
+    <!-- ===================================================================== post-call -->
+
+    <!-- `ended`: { callId, reason, hangupBy, sipStatus, durationMs, features } — the call-level
+         acoustic metrics the transport measured (talk time and ratio, silence, dead air,
+         interruptions, overtalk, speech rate, pitch and energy), no model involved. -->
+    <bpmn:serviceTask id="PostCall" name="Collect the call's facts (FEEL)">
+      <bpmn:incoming>F_ended</bpmn:incoming>
+      <bpmn:outgoing>F_post_call</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>endedAt</bpmn:to></bpmn:assignment>
+        <!-- Whose voice is analysed. Customers only; see the README before adding "agent". -->
+        <bpmn:assignment><bpmn:from>["customer"]</bpmn:from><bpmn:to>analyzedParties</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_post_call" sourceRef="PostCall" targetRef="AnyTurns"/>
+
+    <bpmn:exclusiveGateway id="AnyTurns" name="Did the caller speak?" default="F_no_turns">
+      <bpmn:incoming>F_post_call</bpmn:incoming>
+      <bpmn:outgoing>F_has_turns</bpmn:outgoing>
+      <bpmn:outgoing>F_no_turns</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_has_turns" sourceRef="AnyTurns" targetRef="PrepAnalysis">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">count(turns) &gt; 0</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_no_turns" sourceRef="AnyTurns" targetRef="NoAnalysis"/>
+
+    <!-- The customer's own audio, turn by turn, to a model that hears the voice (emotion, tone,
+         hesitation), answering as a JSON object. -->
+    <bpmn:serviceTask id="PrepAnalysis" name="Ask for the analysis (FEEL)">
+      <bpmn:incoming>F_has_turns</bpmn:incoming><bpmn:outgoing>F_prep_analysis</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{json: true, system: "You analyse recorded customer calls for a service team. You hear the customer's voice. Report only what the voice and words support; never identify the person or infer sensitive attributes.", messages: concatenate(for t in turns return {role: "user", content: "Customer, turn " + string(t.index) + ".", audio: t.audio}, [{role: "user", content: "Analyse the customer's emotion and sentiment per turn and over the call. Answer with a JSON object with the keys analyzedParties (a list naming the analysed party: customer), customer (overall; trajectory, a list of turn, emotion and sentiment from -1 to 1; escalation, a boolean), resolved (a boolean: was the customer's issue resolved on this call), topic and summary."}])}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_analysis" sourceRef="PrepAnalysis" targetRef="Analyse"/>
+    <bpmn:serviceTask id="Analyse" name="Analyse the customer's voice" implementation="channel:analytics-model">
+      <bpmn:extensionElements><q:timeout duration="PT120S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_analysis</bpmn:incoming><bpmn:outgoing>F_analysed</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload.json</bpmn:from><bpmn:to>analysis</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>payload.audioPreserved</bpmn:from><bpmn:to>audioPreserved</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_analysed" sourceRef="Analyse" targetRef="LoadPrior"/>
+    <bpmn:serviceTask id="NoAnalysis" name="Nothing to analyse (FEEL)">
+      <bpmn:incoming>F_no_turns</bpmn:incoming><bpmn:outgoing>F_no_analysis</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{analyzedParties: [], resolved: false, topic: "none", summary: "The caller did not speak."}</bpmn:from><bpmn:to>analysis</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>audioPreserved</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_no_analysis" sourceRef="NoAnalysis" targetRef="LoadPrior"/>
+
+    <!-- The repeat window: the caller's previous contact, looked up by caller number. -->
+    <bpmn:serviceTask id="LoadPrior" name="Find the caller's previous contact">
+      <bpmn:incoming>F_analysed</bpmn:incoming>
+      <bpmn:incoming>F_no_analysis</bpmn:incoming>
+      <bpmn:outgoing>F_loaded</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrCallerRead</bpmn:sourceRef>
+        <bpmn:targetRef>doPrior</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_loaded" sourceRef="LoadPrior" targetRef="Facts"/>
+
+    <bpmn:serviceTask id="Facts" name="The outcome table's inputs (FEEL)">
+      <bpmn:incoming>F_loaded</bpmn:incoming><bpmn:outgoing>F_facts</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>prior != null</bpmn:from><bpmn:to>hasPrior</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>if prior = null then null else (now() - dateAndTime(prior.lastAt)).days</bpmn:from><bpmn:to>daysSinceLast</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>analysis.resolved = true</bpmn:from><bpmn:to>modelResolved</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_facts" sourceRef="Facts" targetRef="Decide"/>
+
+    <bpmn:businessRuleTask id="Decide" name="Decide the outcome (DMN)" implementation="contact-outcome.dmn">
+      <bpmn:incoming>F_facts</bpmn:incoming><bpmn:outgoing>F_decided</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:sequenceFlow id="F_decided" sourceRef="Decide" targetRef="BuildRecord"/>
+
+    <bpmn:serviceTask id="BuildRecord" name="Build the interaction record (FEEL)">
+      <bpmn:incoming>F_decided</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, caller: caller, direction: "inbound", startedAt: startedAt, endedAt: endedAt, endReason: ended.reason, hangupBy: ended.hangupBy, durationMs: ended.durationMs, transferred: transferred, turns: for t in turns return {index: t.index, bargeIn: t.bargeIn, features: t.features}, acoustic: ended.features, analyzedParties: analyzedParties, analysis: analysis, audioPreserved: audioPreserved, outcome: outcome, resolved: resolved, repeatContact: repeatContact, firstContactResolution: firstContactResolution, previousCallId: if prior = null then null else prior.lastCallId}</bpmn:from>
+          <bpmn:to>record</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{lastCallId: callId, lastAt: endedAt, lastResolved: resolved, contacts: if prior = null then 1 else prior.contacts + 1}</bpmn:from>
+          <bpmn:to>callerIndex</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>priorFcr</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_built" sourceRef="BuildRecord" targetRef="Save"/>
+
+    <bpmn:serviceTask id="Save" name="Store the record and the caller's index">
+      <bpmn:incoming>F_built</bpmn:incoming><bpmn:outgoing>F_saved</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doRecord</bpmn:sourceRef>
+        <bpmn:targetRef>dsrRecord</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doCallerIndex</bpmn:sourceRef>
+        <bpmn:targetRef>dsrCallerWrite</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_saved" sourceRef="Save" targetRef="WasRepeat"/>
+
+    <!-- A repeat contact means the previous call did not resolve the issue after all. -->
+    <bpmn:exclusiveGateway id="WasRepeat" name="Repeat contact?" default="F_not_repeat">
+      <bpmn:incoming>F_saved</bpmn:incoming>
+      <bpmn:outgoing>F_repeat</bpmn:outgoing>
+      <bpmn:outgoing>F_not_repeat</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_repeat" sourceRef="WasRepeat" targetRef="RevisePrior">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">repeatContact = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_not_repeat" sourceRef="WasRepeat" targetRef="End"/>
+    <bpmn:serviceTask id="RevisePrior" name="The previous call was not a first-contact resolution">
+      <bpmn:incoming>F_repeat</bpmn:incoming><bpmn:outgoing>F_revised</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doPriorFcr</bpmn:sourceRef>
+        <bpmn:targetRef>dsrPriorFcr</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_revised" sourceRef="RevisePrior" targetRef="End"/>
+
+    <bpmn:endEvent id="End" name="Interaction recorded">
+      <bpmn:incoming>F_not_repeat</bpmn:incoming>
+      <bpmn:incoming>F_revised</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

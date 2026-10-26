@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ONE SEGMENT ANALYSIS, STORED. For every time segment of the session and every participant whose
+  role is analysed, the `voip` transport sends that participant's audio of the segment, its
+  sampled camera frames and the words spoken to a video-understanding model, and delivers the
+  answer on `call-analysis`; each one starts this short process, which writes it to the
+  `analysis` store under "<callId>:<participantIndex>:<segment>" and ends.
+
+  The answer is per participant and per segment: expression, engagement / attention, body-language
+  cues, a fused emotion estimate stating which modalities (voice, face, body, words) support it
+  and with what confidence, and whether the modalities DISAGREE (reported, never averaged away).
+  A listener is analysed as well as the speaker: a reaction is often the most telling cue.
+
+  It is ADVISORY data for people to review, never an automated decision about anyone. No frame is
+  stored here or anywhere: the transport keeps frames in memory until their segment is analysed.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_segment_analysis"
+                  targetNamespace="urn:sutra:module:video-meeting-assistant:1.0.0">
+
+  <bpmn:dataStore id="analysisStore" name="analysis"/>
+
+  <bpmn:process id="segment-analysis" name="Store one segment analysis" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doRow" name="row"/>
+    <bpmn:dataStoreReference id="dsrRow" name="analysis" dataStoreRef="analysisStore">
+      <bpmn:extensionElements><q:store key="analysis.key"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- { callId, key, participantId, participantIndex, label, role, segment, startMs, endMs,
+         speaking, talkMs, frames, framesRequested, audioMs, audioSent, features, flaggedMoments,
+         provider, model, status, result, removedKeys, missingFields | detail } -->
+    <bpmn:startEvent id="Start" name="Segment analysed">
+      <bpmn:extensionElements>
+        <q:source channel="call-analysis" name="analysis" dataClass="pii"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="BuildRow"/>
+
+    <bpmn:serviceTask id="BuildRow" name="The row (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{callId: analysis.callId, participantId: analysis.participantId, participantIndex: analysis.participantIndex, label: analysis.label, role: analysis.role, segment: analysis.segment, startMs: analysis.startMs, endMs: analysis.endMs, speaking: analysis.speaking, talkMs: analysis.talkMs, frames: analysis.frames, framesRequested: analysis.framesRequested, audioMs: analysis.audioMs, audioSent: analysis.audioSent, acoustic: analysis.features, flaggedMoments: analysis.flaggedMoments, status: analysis.status, result: analysis.result, removedKeys: analysis.removedKeys, detail: analysis.detail, provider: analysis.provider, model: analysis.model, advisory: true, recordedAt: string(now())}</bpmn:from>
+          <bpmn:to>row</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_built" sourceRef="BuildRow" targetRef="Save"/>
+
+    <bpmn:serviceTask id="Save" name="Store the analysis">
+      <bpmn:incoming>F_built</bpmn:incoming><bpmn:outgoing>F_saved</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doRow</bpmn:sourceRef>
+        <bpmn:targetRef>dsrRow</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_saved" sourceRef="Save" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Stored"><bpmn:incoming>F_saved</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The row type of the meeting-assistant's `transcripts` data store (datastores.yaml
+  `structure: {schema: urn:meeting, type: TranscriptSegment}`): one typed column per child.
+
+  Every child is a scalar with maxOccurs=1 — a projected store must be flat. maxLength sizes each
+  VARCHAR, and `sutra lint` compares the facets against the DDL in migrations/transcripts/.
+  Column names are the default fold of the field names (startMs -> start_ms).
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:sutra:meeting"
+           xmlns="urn:sutra:meeting"
+           elementFormDefault="qualified">
+
+  <xs:simpleType name="CallId">
+    <xs:restriction base="xs:string"><xs:maxLength value="64"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Label">
+    <xs:restriction base="xs:string"><xs:maxLength value="40"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="ModelId">
+    <xs:restriction base="xs:string"><xs:maxLength value="80"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="SegmentText">
+    <xs:restriction base="xs:string"><xs:maxLength value="4000"/></xs:restriction>
+  </xs:simpleType>
+
+  <!-- `transcripts`, keyed by "<callId>:<seq>" (seq counts from 1 in the order segments
+       completed). speaker is "unknown" with speakerSource "none" when the live session labels
+       no speakers (OpenAI Realtime and Gemini Live label none; a conference dial-in is one mixed
+       channel); the report attributes the transcript afterwards. startMs / endMs are offsets
+       into the call's audio (and so into its recording). -->
+  <xs:complexType name="TranscriptSegment">
+    <xs:sequence>
+      <xs:element name="callId"        type="CallId"/>
+      <xs:element name="seq"           type="xs:int"/>
+      <xs:element name="speaker"       type="Label"/>
+      <xs:element name="speakerSource" type="Label"/>
+      <xs:element name="startMs"       type="xs:int"/>
+      <xs:element name="endMs"         type="xs:int"/>
+      <xs:element name="text"          type="SegmentText"/>
+      <xs:element name="provider"      type="Label"/>
+      <xs:element name="model"         type="ModelId"/>
+      <xs:element name="recordedAt"    type="xs:dateTime"/>
+    </xs:sequence>
+  </xs:complexType>
+
+</xs:schema>

@@ -1,0 +1,49 @@
+{{!-- The meeting report, as text (Markdown). It renders only what the flow already decided:
+   the model's minutes after the analysis policy was applied (`view.speakers` carries an emotion
+   and a sentiment only for an analysed party), the call's acoustic metrics, and the recording's
+   REFERENCE — never the audio. --}}
+# {{view.title}}
+
+Meeting {{view.meetingId}} — joined {{view.joinedAt}}, ended {{view.endedAt}}.
+
+## Summary
+
+{{view.summary}}
+
+## Decisions
+{{#each view.decisions}}
+- {{this}}
+{{/each}}
+
+## Action items
+{{#each view.actionItems}}
+- {{this.item}} — {{this.owner}}{{#if this.due}}, due {{this.due}}{{/if}}
+{{/each}}
+
+## Speakers
+
+{{view.attribution}}
+{{#each view.speakers}}
+- {{this.name}} ({{this.role}}): about {{this.talkTimeMs}} ms of speech{{#if this.analyzed}}; sentiment {{this.sentiment}}, {{this.emotion}}{{else}}; not analysed{{/if}}
+{{/each}}
+
+Emotion and sentiment are advisory, inferred by a model, for the people reading this report —
+never a decision about anyone. Analysed roles: {{#each view.analyzedRoles}}{{this}} {{/each}}
+
+## The call
+
+{{view.segments}} transcript segments. Talk {{view.acoustic.callerTalkMs}} ms, silence
+{{view.acoustic.silenceMs}} ms, longest silence {{view.acoustic.longestSilenceMs}} ms.
+{{#each view.keywords}}
+- "{{this.phrase}}" heard at {{this.atMs}} ms
+{{/each}}
+
+## Recording
+
+{{#if view.recording.uri}}
+{{view.recording.uri}} — SHA-256 {{view.recording.sha256}}, {{view.recording.durationMs}} ms,
+{{view.recording.format}}{{#if view.recording.consentAnnounced}}; the recording and transcription
+announcement was played{{/if}}.
+{{else}}
+Not recorded.
+{{/if}}

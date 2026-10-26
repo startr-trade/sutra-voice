@@ -1,0 +1,5 @@
+# Codec manifest for the `ivr` schema. No channel binds it: its job is to be the row type of the
+# module's three data stores (datastores.yaml `structure.schema: urn:ivr`), which is what turns
+# the complexTypes in ivr.xsd into typed table columns.
+schemaKind: xsd
+formats: [xml]

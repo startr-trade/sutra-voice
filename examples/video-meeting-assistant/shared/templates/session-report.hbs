@@ -1,0 +1,24 @@
+{{!-- The session report, as text (Markdown). It renders only what the transport and the flow
+   already decided: who was in the room and with which role, who was analysed and why not, the
+   analysis digest of each analysed participant, and each recording's REFERENCE — never media. --}}
+# Meeting {{view.room}}
+
+Session {{view.callId}} — started {{view.startedAt}}, ended {{view.endedAt}} ({{view.durationMs}} ms).
+Recording and analysis announced in the room: {{view.consentAnnounced}}.
+
+## Participants
+{{#each view.participants}}
+- P{{this.participantIndex}} {{this.label}} ({{this.role}}): about {{this.talkMs}} ms of speech, {{this.transcriptLines}} transcript segments{{#if this.analysed}}; analysed over {{this.segments}} segments — mostly {{this.emotion}}, engagement {{this.engagement}}, {{this.disagreements}} segments where voice, face and words disagreed{{else}}; not analysed ({{this.analysisPolicy}}){{/if}}.
+  Recording: {{this.recordingUri}} (SHA-256 {{this.recordingSha256}})
+{{/each}}
+
+## How this was produced
+
+Each participant's own audio track was transcribed (exact attribution). Video was sampled at
+{{view.video.fps}} frame(s) per second plus frames at turn boundaries and flagged moments; frames
+were held in memory until analysed and never stored. Analysis by {{view.analysis.provider}} /
+{{view.analysis.model}} over {{view.analysis.segmentMs}} ms segments: {{view.analysis.results}}
+results, {{view.analysis.failed}} failed. Analysed roles: {{#each view.analysis.analysedRoles}}{{this}} {{/each}}
+
+Expression, engagement and emotion are advisory estimates by a model, for the people reading this
+report. They are not a decision about anyone, and no participant was identified.

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ONE TRANSCRIPT SEGMENT, STORED. The `voip` transport delivers each final segment of a
+  listen-only call's live transcription on `call-transcript`, as it completes; each one starts
+  this short process, which writes it to the `transcripts` store under "<callId>:<seq>" and ends.
+  The meeting's own instance is not woken per segment — it reads the transcript back after the
+  call (meeting-call.bpmn). Segments of one call arrive in order, and every one of them before
+  the call's hang-up.
+
+  speaker is "unknown" (speakerSource "none") when the live session labels no speakers — the
+  sessions this example uses label none, and a conference dial-in is one mixed channel.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_transcript_segment"
+                  targetNamespace="urn:sutra:module:meeting-assistant:1.0.0">
+
+  <bpmn:dataStore id="transcriptsStore" name="transcripts"/>
+
+  <bpmn:process id="transcript-segment" name="Store one transcript segment" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doRow" name="row"/>
+    <bpmn:dataStoreReference id="dsrRow" name="transcripts" dataStoreRef="transcriptsStore">
+      <bpmn:extensionElements><q:store key="segment.key"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- { callId, seq, key, itemId, speaker, speakerSource, startMs, endMs, text, provider,
+         model, features } -->
+    <bpmn:startEvent id="Start" name="Segment transcribed">
+      <bpmn:extensionElements>
+        <q:source channel="call-transcript" name="segment" dataClass="pii"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="BuildRow"/>
+
+    <bpmn:serviceTask id="BuildRow" name="The row (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{callId: segment.callId, seq: segment.seq, speaker: segment.speaker, speakerSource: segment.speakerSource, startMs: segment.startMs, endMs: segment.endMs, text: substring(segment.text, 1, 4000), provider: segment.provider, model: segment.model, recordedAt: string(now())}</bpmn:from>
+          <bpmn:to>row</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_built" sourceRef="BuildRow" targetRef="Save"/>
+
+    <bpmn:serviceTask id="Save" name="Store the segment">
+      <bpmn:incoming>F_built</bpmn:incoming><bpmn:outgoing>F_saved</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doRow</bpmn:sourceRef>
+        <bpmn:targetRef>dsrRow</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_saved" sourceRef="Save" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Stored"><bpmn:incoming>F_saved</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

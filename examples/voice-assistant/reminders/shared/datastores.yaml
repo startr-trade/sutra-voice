@@ -1,0 +1,14 @@
+# Data stores of the voice-reminders module, 1.0.0 — referenced BY NAME from the BPMN.
+#
+#   reminders   one item per appointment (keyed by appointmentId): the call's outcome
+#               (answered / reminded / unreachable), the attempts it took, when the call was
+#               answered and ended, and what the patient replied
+datastores:
+  - name: reminders
+    type: sql
+    sql:
+      url-ref: env:VOICE_DB_URL
+      username-ref: env:VOICE_DB_USER
+      password-ref: env:VOICE_DB_PASSWORD
+      migrations: migrations/reminders
+    dataClass: personal

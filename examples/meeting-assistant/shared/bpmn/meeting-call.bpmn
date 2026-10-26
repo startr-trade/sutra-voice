@@ -1,0 +1,424 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A MEETING ASSISTANT: dial into a conference, announce itself, listen, and report afterwards.
+
+    join (an HTTP request, or scheduled-join for a standing meeting)
+      -> dial the conference's dial-in number (voip://originate, mode: listen, on the pooled
+         `originate` channel)
+      -> OUTCOME (event-based gateway: the dial's outcome on call-progress, or no news for 3 min)
+           connected                -> the PIN as DTMF -> the consent announcement -> IN THE MEETING
+           busy / no-answer / failed -> record the failure
+      IN THE MEETING (event-based gateway, re-entered after every keyword):
+           call-keyword  a configured phrase was heard -> noted -> back to IN THE MEETING
+           call-hangup   the meeting ended (the conference hung up)
+           4 hours       the bot leaves (voip://hangup), then waits for the hang-up
+      -> read the transcript back (one store read per segment, a loop)
+      -> the report: a model job (JSON: summary, decisions, action items, speakers) over the
+         transcript and the call's acoustic metrics
+      -> the analysis policy applied (below) -> rendered (meeting-report.hbs)
+      -> stored (meetings, "report:<meetingId>") and handed to `report-out`, with the recording's
+         reference.
+
+  THE MEDIA PLANE never passes through this flow. `<q:audit capture="media">` marks every request
+  this process sends, and the `voip` transport records a marked call: the audio goes to the
+  deployment's object store, sealed (envelope encryption), and the hang-up carries only its
+  REFERENCE (uri, SHA-256 of the stored object, duration, format, consentAnnounced). The audit
+  events of this process carry that reference too — never the audio. The live transcription runs
+  in the transport as well; each final segment is stored by transcript-segment.bpmn while the
+  call is up.
+
+  SPEAKERS. A conference dial-in is one mixed audio channel and the live sessions label no
+  speakers, so every segment says speaker "unknown". The report model attributes the transcript to
+  the participants from what was said, and the report marks that attribution as inferred.
+
+  ANALYSIS POLICY (emotion, sentiment). External participants are analysed. Internal participants
+  (staff) are analysed ONLY when this deployment allows it (`internalAnalysisAllowed`, false as
+  shipped) AND the request opts them in (`analysis.internalOptIn`) — in the EU, inferring the
+  emotions of people at work is prohibited (AI Act). The policy is applied twice: the prompt asks
+  for no emotion of a party that is not analysed, and whatever the model returns for one anyway is
+  dropped here. The analysis is advisory, for people to read, never an automated decision.
+
+  CONSENT. The announcement is played before the bot listens; the recording reports whether it was
+  played to the end, and where in the recording.
+
+  CORRELATION. The flow names the call itself (`meeting-<meetingId>`) before dialling, so every
+  event of the call finds this instance through the start event's alias.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_meeting_call"
+                  targetNamespace="urn:sutra:module:meeting-assistant:1.0.0">
+
+  <bpmn:dataStore id="transcriptsStore" name="transcripts"/>
+  <bpmn:dataStore id="meetingsStore" name="meetings"/>
+
+  <bpmn:process id="meeting-call" name="Join, listen to and report on a meeting" isExecutable="true">
+
+    <bpmn:extensionElements>
+      <q:audit capture="media"/>
+      <q:variables>
+        <!-- The join request holds the meeting PIN: persisted (the call needs it), redacted in
+             logs and audit. -->
+        <q:variable name="meeting" type="object" sensitive="true"/>
+        <q:variable name="pin" type="string" sensitive="true"/>
+        <q:variable name="callId" type="string"/>
+        <q:variable name="status" type="string"/>
+      </q:variables>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doSegment" name="segment"/>
+    <bpmn:dataObject id="doRecord" name="record"/>
+    <bpmn:dataStoreReference id="dsrSegment" name="transcripts" dataStoreRef="transcriptsStore">
+      <bpmn:extensionElements><q:store key="segmentKey"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+    <bpmn:dataStoreReference id="dsrReport" name="meetings" dataStoreRef="meetingsStore">
+      <bpmn:extensionElements><q:store key="&quot;report:&quot; + meeting.meetingId"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <!-- { meetingId, title, dialIn, pin, participants: [{name, role}], analysis?: {internalOptIn} } -->
+    <bpmn:startEvent id="Start" name="Join this meeting">
+      <bpmn:extensionElements>
+        <q:source channel="join" name="meeting" dataClass="pii"/>
+        <q:alias name="callKey" expression="if getValue(header, &quot;x-call-id&quot;) = null then &quot;meeting-&quot; + meeting.meetingId else getValue(header, &quot;x-call-id&quot;)" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="Init"/>
+    <!-- The same request, handed over by scheduled-join for a standing meeting. -->
+    <bpmn:startEvent id="StartScheduled" name="A standing meeting is due">
+      <bpmn:extensionElements>
+        <q:source channel="join-scheduled" name="meeting" dataClass="pii"/>
+        <q:alias name="callKey" expression="if getValue(header, &quot;x-call-id&quot;) = null then &quot;meeting-&quot; + meeting.meetingId else getValue(header, &quot;x-call-id&quot;)" unique="true" onConflict="correlate"/>
+      </bpmn:extensionElements>
+      <bpmn:outgoing>F_start_scheduled</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start_scheduled" sourceRef="StartScheduled" targetRef="Init"/>
+
+    <bpmn:serviceTask id="Init" name="Prepare (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming>
+      <bpmn:incoming>F_start_scheduled</bpmn:incoming>
+      <bpmn:outgoing>F_init</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"meeting-" + meeting.meetingId</bpmn:from><bpmn:to>callId</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>meeting.pin</bpmn:from><bpmn:to>pin</bpmn:to></bpmn:assignment>
+        <!-- THE DEPLOYMENT SWITCH: may a request opt internal staff into emotion analysis? Off as
+             shipped. Turning it on is a decision for your counsel (EU: prohibited at work). -->
+        <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>internalAnalysisAllowed</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>[]</bpmn:from><bpmn:to>keywords</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>"dialling"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>joinedAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>ended</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>progress</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_init" sourceRef="Init" targetRef="Policy"/>
+
+    <bpmn:serviceTask id="Policy" name="Who is analysed (FEEL)">
+      <bpmn:incoming>F_init</bpmn:incoming><bpmn:outgoing>F_policy</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>if internalAnalysisAllowed and meeting.analysis != null and meeting.analysis.internalOptIn = true then ["external", "internal"] else ["external"]</bpmn:from>
+          <bpmn:to>analyzedRoles</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_policy" sourceRef="Policy" targetRef="PrepDial"/>
+
+    <bpmn:serviceTask id="PrepDial" name="Dial request (FEEL)">
+      <bpmn:incoming>F_policy</bpmn:incoming><bpmn:outgoing>F_prep_dial</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <!-- A bare number is dialled through the gateway's trunk (SUTRA_VOIP_TRUNK). -->
+        <bpmn:assignment><bpmn:from>{callId: callId, destination: meeting.dialIn, callerId: "+15551230000", timeoutSecs: 45, mode: "listen"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_dial" sourceRef="PrepDial" targetRef="Dial"/>
+    <bpmn:sendTask id="Dial" name="Dial the conference (waits for a free line)">
+      <bpmn:extensionElements>
+        <q:send channel="originate">
+          <q:header name="x-call-id" value="callId"/>
+        </q:send>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F_prep_dial</bpmn:incoming><bpmn:outgoing>F_dialled</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_dialled" sourceRef="Dial" targetRef="Outcome"/>
+
+    <bpmn:eventBasedGateway id="Outcome" name="Dial outcome">
+      <bpmn:incoming>F_dialled</bpmn:incoming>
+      <bpmn:outgoing>F_to_progress</bpmn:outgoing>
+      <bpmn:outgoing>F_to_no_news</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_progress" sourceRef="Outcome" targetRef="Progressed"/>
+    <bpmn:sequenceFlow id="F_to_no_news" sourceRef="Outcome" targetRef="NoNews"/>
+    <bpmn:intermediateCatchEvent id="Progressed" name="Outcome">
+      <bpmn:extensionElements><q:source channel="call-progress" name="progress"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_progress</bpmn:incoming><bpmn:outgoing>F_progress</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="NoNews" name="No news for 3 min">
+      <bpmn:incoming>F_to_no_news</bpmn:incoming><bpmn:outgoing>F_no_news</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT3M</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_progress" sourceRef="Progressed" targetRef="Connected"/>
+    <bpmn:sequenceFlow id="F_no_news" sourceRef="NoNews" targetRef="NotJoined"/>
+    <bpmn:exclusiveGateway id="Connected" name="Connected?" default="F_not_joined">
+      <bpmn:incoming>F_progress</bpmn:incoming>
+      <bpmn:outgoing>F_connected</bpmn:outgoing>
+      <bpmn:outgoing>F_not_joined</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_connected" name="connected" sourceRef="Connected" targetRef="PrepPin">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">progress.status = "connected"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_not_joined" name="busy / no answer / failed" sourceRef="Connected" targetRef="NotJoined"/>
+
+    <bpmn:serviceTask id="NotJoined" name="Not joined (FEEL)">
+      <bpmn:incoming>F_no_news</bpmn:incoming>
+      <bpmn:incoming>F_not_joined</bpmn:incoming>
+      <bpmn:outgoing>F_not_joined_record</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"join-failed"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{meetingId: meeting.meetingId, title: meeting.title, callId: callId, status: status, reason: if progress = null then "no-news" else progress.status, failedAt: string(now())}</bpmn:from>
+          <bpmn:to>record</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_not_joined_record" sourceRef="NotJoined" targetRef="SaveFailure"/>
+    <bpmn:serviceTask id="SaveFailure" name="Store the failure">
+      <bpmn:incoming>F_not_joined_record</bpmn:incoming><bpmn:outgoing>F_failure_saved</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doRecord</bpmn:sourceRef>
+        <bpmn:targetRef>dsrReport</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_failure_saved" sourceRef="SaveFailure" targetRef="EndNotJoined"/>
+    <bpmn:endEvent id="EndNotJoined" name="Not joined"><bpmn:incoming>F_failure_saved</bpmn:incoming></bpmn:endEvent>
+
+    <!-- ---- joining: the PIN, then the announcement ---- -->
+    <bpmn:serviceTask id="PrepPin" name="The PIN (FEEL)">
+      <bpmn:incoming>F_connected</bpmn:incoming><bpmn:outgoing>F_prep_pin</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>joinedAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>{callId: callId, digits: pin + "#", gapMs: 250}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_pin" sourceRef="PrepPin" targetRef="SendPin"/>
+    <bpmn:serviceTask id="SendPin" name="Enter the PIN (DTMF)" implementation="channel:dtmf">
+      <bpmn:extensionElements><q:timeout duration="PT30S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_pin</bpmn:incoming><bpmn:outgoing>F_pin_sent</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_pin_sent" sourceRef="SendPin" targetRef="PrepConsent"/>
+    <bpmn:serviceTask id="PrepConsent" name="The announcement (FEEL)">
+      <bpmn:incoming>F_pin_sent</bpmn:incoming><bpmn:outgoing>F_prep_consent</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, prompt: "meeting-assistant/consent", consent: true}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_consent" sourceRef="PrepConsent" targetRef="Announce"/>
+    <bpmn:serviceTask id="Announce" name="Announce recording and transcription" implementation="channel:play">
+      <bpmn:extensionElements><q:timeout duration="PT60S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_consent</bpmn:incoming><bpmn:outgoing>F_announced</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_announced" sourceRef="Announce" targetRef="Joined"/>
+    <bpmn:serviceTask id="Joined" name="Listening (FEEL)">
+      <bpmn:incoming>F_announced</bpmn:incoming><bpmn:outgoing>F_joined</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"listening"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_joined" sourceRef="Joined" targetRef="InMeeting"/>
+
+    <!-- ---- in the meeting: sparse events only ---- -->
+    <bpmn:eventBasedGateway id="InMeeting" name="In the meeting">
+      <bpmn:incoming>F_joined</bpmn:incoming>
+      <bpmn:incoming>F_noted</bpmn:incoming>
+      <bpmn:outgoing>F_to_keyword</bpmn:outgoing>
+      <bpmn:outgoing>F_to_ended</bpmn:outgoing>
+      <bpmn:outgoing>F_to_too_long</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="F_to_keyword" sourceRef="InMeeting" targetRef="Heard"/>
+    <bpmn:sequenceFlow id="F_to_ended" sourceRef="InMeeting" targetRef="MeetingEnded"/>
+    <bpmn:sequenceFlow id="F_to_too_long" sourceRef="InMeeting" targetRef="TooLong"/>
+    <!-- { callId, phrase, segmentSeq, atMs, text } -->
+    <bpmn:intermediateCatchEvent id="Heard" name="A phrase was heard">
+      <bpmn:extensionElements><q:source channel="call-keyword" name="keyword" dataClass="pii"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_keyword</bpmn:incoming><bpmn:outgoing>F_heard</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <!-- { callId, reason, hangupBy, durationMs, features, transcript, recording, mode } -->
+    <bpmn:intermediateCatchEvent id="MeetingEnded" name="The meeting ended">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended" dataClass="pii"/></bpmn:extensionElements>
+      <bpmn:incoming>F_to_ended</bpmn:incoming><bpmn:outgoing>F_ended</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="TooLong" name="Four hours">
+      <bpmn:incoming>F_to_too_long</bpmn:incoming><bpmn:outgoing>F_too_long</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT4H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:serviceTask id="NoteKeyword" name="Note the phrase (FEEL)">
+      <bpmn:incoming>F_heard</bpmn:incoming><bpmn:outgoing>F_noted</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>append(keywords, {phrase: keyword.phrase, segmentSeq: keyword.segmentSeq, atMs: keyword.atMs})</bpmn:from><bpmn:to>keywords</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_heard" sourceRef="Heard" targetRef="NoteKeyword"/>
+    <!-- THE LOOP: back to the same wait. -->
+    <bpmn:sequenceFlow id="F_noted" sourceRef="NoteKeyword" targetRef="InMeeting"/>
+
+    <bpmn:serviceTask id="PrepLeave" name="Leave (FEEL)">
+      <bpmn:incoming>F_too_long</bpmn:incoming><bpmn:outgoing>F_prep_leave</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>{callId: callId, reason: "time-limit"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_too_long" sourceRef="TooLong" targetRef="PrepLeave"/>
+    <bpmn:sequenceFlow id="F_prep_leave" sourceRef="PrepLeave" targetRef="Leave"/>
+    <bpmn:sendTask id="Leave" name="Hang up">
+      <bpmn:extensionElements><q:send channel="hangup"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_leave</bpmn:incoming><bpmn:outgoing>F_left</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_left" sourceRef="Leave" targetRef="LeftEnded"/>
+    <bpmn:intermediateCatchEvent id="LeftEnded" name="Call ended">
+      <bpmn:extensionElements><q:source channel="call-hangup" name="ended" dataClass="pii"/></bpmn:extensionElements>
+      <bpmn:incoming>F_left</bpmn:incoming><bpmn:outgoing>F_left_ended</bpmn:outgoing>
+      <bpmn:messageEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_ended" sourceRef="MeetingEnded" targetRef="AfterCall"/>
+    <bpmn:sequenceFlow id="F_left_ended" sourceRef="LeftEnded" targetRef="AfterCall"/>
+
+    <!-- ---- after the call: the transcript, read back ---- -->
+    <bpmn:serviceTask id="AfterCall" name="After the call (FEEL)">
+      <bpmn:incoming>F_ended</bpmn:incoming>
+      <bpmn:incoming>F_left_ended</bpmn:incoming>
+      <bpmn:outgoing>F_after</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"reporting"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>endedAt</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>if ended.transcript = null or ended.transcript.segments = null then 0 else ended.transcript.segments</bpmn:from><bpmn:to>segmentCount</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>1</bpmn:from><bpmn:to>segmentSeq</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>[]</bpmn:from><bpmn:to>segments</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_after" sourceRef="AfterCall" targetRef="MoreSegments"/>
+    <bpmn:exclusiveGateway id="MoreSegments" name="Another segment?" default="F_all_read">
+      <bpmn:incoming>F_after</bpmn:incoming>
+      <bpmn:incoming>F_collected</bpmn:incoming>
+      <bpmn:outgoing>F_read_next</bpmn:outgoing>
+      <bpmn:outgoing>F_all_read</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_read_next" name="yes" sourceRef="MoreSegments" targetRef="PrepRead">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">segmentSeq &lt;= segmentCount</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_all_read" sourceRef="MoreSegments" targetRef="PrepReport"/>
+    <bpmn:serviceTask id="PrepRead" name="Segment key (FEEL)">
+      <bpmn:incoming>F_read_next</bpmn:incoming><bpmn:outgoing>F_prep_read</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>callId + ":" + string(segmentSeq)</bpmn:from><bpmn:to>segmentKey</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_read" sourceRef="PrepRead" targetRef="ReadSegment"/>
+    <bpmn:serviceTask id="ReadSegment" name="Read the segment">
+      <bpmn:incoming>F_prep_read</bpmn:incoming><bpmn:outgoing>F_read</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrSegment</bpmn:sourceRef>
+        <bpmn:targetRef>doSegment</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_read" sourceRef="ReadSegment" targetRef="Collect"/>
+    <bpmn:serviceTask id="Collect" name="Collect it (FEEL)">
+      <bpmn:incoming>F_read</bpmn:incoming><bpmn:outgoing>F_collected</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>if segment = null then segments else append(segments, segment)</bpmn:from><bpmn:to>segments</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>segmentSeq + 1</bpmn:from><bpmn:to>segmentSeq</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <!-- THE READ LOOP. -->
+    <bpmn:sequenceFlow id="F_collected" sourceRef="Collect" targetRef="MoreSegments"/>
+
+    <!-- ---- the report: a model job over the transcript ---- -->
+    <bpmn:serviceTask id="PrepReport" name="Ask for the report (FEEL)">
+      <bpmn:incoming>F_all_read</bpmn:incoming><bpmn:outgoing>F_prep_report</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{json: true, meetingId: meeting.meetingId, system: "You write the minutes of a recorded meeting from its transcript. The transcript has no speaker labels: attribute each line to a participant only from what is said, and mark the attribution as inferred. Never identify anyone who is not a listed participant, and never infer sensitive attributes. Report emotion and sentiment ONLY for participants whose role is one of: " + string(analyzedRoles) + "; for any other participant give null.", messages: concatenate([{role: "user", content: "Meeting: " + meeting.title + ". Participants: " + string(for p in meeting.participants return p.name + " (" + p.role + ")") + ". Call metrics (from the audio, all speakers together): " + string(if ended.features = null then {} else ended.features) + ". Transcript, one line per segment, with offsets in ms:"}], for s in segments return {role: "user", content: "[" + string(s.startMs) + "-" + string(s.endMs) + "] " + s.text}, [{role: "user", content: "Answer with a JSON object with the keys summary (two sentences), decisions (a list of strings), actionItems (a list of owner, item, due), speakers (a list of name, role, talkTimeMs, attribution, sentiment, emotion) and attribution (how the speakers were attributed)."}])}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+        <!-- The reply's park-time shape: the alias below resolves on the request it echoes. -->
+        <bpmn:assignment><bpmn:from>{request: {meetingId: meeting.meetingId}}</bpmn:from><bpmn:to>body</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_report" sourceRef="PrepReport" targetRef="AskReport"/>
+    <!-- A job channel: submitted at once; the result arrives on report-reply. -->
+    <bpmn:serviceTask id="AskReport" name="The report (model job)" implementation="channel:report-model">
+      <bpmn:extensionElements>
+        <q:source channel="report-reply" name="body"/>
+        <q:alias name="reportFor" expression="body.request.meetingId" unique="true"/>
+        <q:timeout duration="PT30M"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F_prep_report</bpmn:incoming><bpmn:outgoing>F_reported</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>body.json</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_reported" sourceRef="AskReport" targetRef="ApplyPolicy"/>
+
+    <!-- The analysis policy, enforced on the answer: a party that is not analysed keeps its name,
+         role and talk time, never an emotion or a sentiment. -->
+    <bpmn:serviceTask id="ApplyPolicy" name="Apply the analysis policy (FEEL)">
+      <bpmn:incoming>F_reported</bpmn:incoming><bpmn:outgoing>F_policy_applied</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>for s in (if answer.speakers = null then [] else answer.speakers) return {name: s.name, role: s.role, talkTimeMs: s.talkTimeMs, attribution: if s.attribution = null then "inferred" else s.attribution, analyzed: count(analyzedRoles[item = s.role]) &gt; 0, sentiment: if count(analyzedRoles[item = s.role]) &gt; 0 then s.sentiment else null, emotion: if count(analyzedRoles[item = s.role]) &gt; 0 then s.emotion else null}</bpmn:from>
+          <bpmn:to>speakers</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{title: meeting.title, meetingId: meeting.meetingId, joinedAt: joinedAt, endedAt: endedAt, summary: answer.summary, decisions: answer.decisions, actionItems: answer.actionItems, speakers: speakers, attribution: answer.attribution, keywords: keywords, segments: count(segments), acoustic: ended.features, recording: ended.recording, analyzedRoles: analyzedRoles}</bpmn:from>
+          <bpmn:to>view</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_policy_applied" sourceRef="ApplyPolicy" targetRef="Render"/>
+
+    <!-- The rendered text lands in `responseBody`. -->
+    <bpmn:serviceTask id="Render" name="Render the report" implementation="meeting-report.hbs">
+      <bpmn:incoming>F_policy_applied</bpmn:incoming><bpmn:outgoing>F_rendered</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_rendered" sourceRef="Render" targetRef="BuildRecord"/>
+
+    <bpmn:serviceTask id="BuildRecord" name="The record (FEEL)">
+      <bpmn:incoming>F_rendered</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"reported"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{meetingId: meeting.meetingId, title: meeting.title, callId: callId, status: "reported", joinedAt: joinedAt, endedAt: endedAt, endReason: ended.reason, hangupBy: ended.hangupBy, durationMs: ended.durationMs, summary: answer.summary, decisions: answer.decisions, actionItems: answer.actionItems, speakers: speakers, attribution: answer.attribution, analyzedRoles: analyzedRoles, keywords: keywords, segments: count(segments), transcript: ended.transcript, acoustic: ended.features, recording: ended.recording, report: responseBody}</bpmn:from>
+          <bpmn:to>record</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_built" sourceRef="BuildRecord" targetRef="SaveReport"/>
+    <bpmn:serviceTask id="SaveReport" name="Store the report">
+      <bpmn:incoming>F_built</bpmn:incoming><bpmn:outgoing>F_saved</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:sourceRef>doRecord</bpmn:sourceRef>
+        <bpmn:targetRef>dsrReport</bpmn:targetRef>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_saved" sourceRef="SaveReport" targetRef="PrepSend"/>
+    <!-- The record is what goes out (as JSON), with the rendered text inside it (`report`): it
+         replaces the render's own `responseBody`, which a send would otherwise carry. -->
+    <bpmn:serviceTask id="PrepSend" name="What is sent (FEEL)">
+      <bpmn:incoming>F_saved</bpmn:incoming><bpmn:outgoing>F_prep_send</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>record</bpmn:from><bpmn:to>responseBody</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_send" sourceRef="PrepSend" targetRef="Deliver"/>
+    <bpmn:sendTask id="Deliver" name="Send the report">
+      <bpmn:extensionElements><q:send channel="report-out"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep_send</bpmn:incoming><bpmn:outgoing>F_delivered</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_delivered" sourceRef="Deliver" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Reported"><bpmn:incoming>F_delivered</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

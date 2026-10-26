@@ -1,0 +1,120 @@
+# Channels for the voice-assistant module, 1.0.0 — the stub variant: both models are the stub in
+# examples/model-stub, so the package runs with no key and no network. This is the variant
+# the engine's tier-2 tests deploy. The live variant differs only in the two model channels.
+#
+#   sutra package examples/voice-assistant/inbound/variants/inbound-stub \
+#       --overlay examples/voice-assistant/inbound/shared --out examples/voice-assistant/deploy/deployments
+#
+# THE CALL. The `voip` transport serves the media WebSocket the PBX dials and turns the call into
+# messages, each carrying the call's id in `x-call-id` (plus `x-caller` / `x-called`):
+#
+#   call-start   a call to a bound number            -> starts inbound-call
+#   call-turn    one utterance of the caller (JSON: the audio as base64 WAV, the turn's acoustic features)
+#   call-dtmf    a key the caller pressed
+#   call-hangup  the call ended (reason, duration, the call's acoustic metrics)
+#
+# and plays, transfers and hangs up through the `voip://` operations below. The engine-wide
+# gateway settings (which PBX, its control socket, the media token) are environment variables —
+# see deploy/compose.yaml and the voip transport reference ("Phone and VoIP calls").
+#
+# THE LINE. A trunk allows a fixed number of concurrent calls, shared by inbound and outbound and
+# by every package on the engine. That count is the `trunk-main` capacity pool, declared in the
+# ENGINE configuration (not here — packages reference it by name):
+#
+#   SUTRA_CAPACITY_POOLS=trunk-main
+#   SUTRA_CAPACITY_POOLS_TRUNK_MAIN_SLOTS=30              # the trunk's concurrent-call limit
+#   SUTRA_CAPACITY_POOLS_TRUNK_MAIN_RESERVE_INBOUND=6     # outbound can never take the last 6
+#
+# A call to the number takes a slot or is refused busy. The slot is held for the CALL, not for the
+# instance: `session-end` releases it when the caller hangs up, while the instance carries on with
+# the post-call analysis.
+
+channels:
+  # ---- the call --------------------------------------------------------------------------------
+
+  - name: call-start
+    transport: voip
+    bind: "number:+15551230000"       # a list, a prefix (number:+1555123*) or number:* also work
+    codec: json
+    pool: trunk-main
+    pool-call-key: header.x-call-id   # one slot per call
+    session-end:
+      on-message: call-hangup         # the hang-up frees the line; the instance runs on
+    # Turn detection (energy VAD) for calls to this number.
+    silence-ms: 700                   # this much silence ends a turn
+    max-turn-ms: 30000                # a turn never runs longer
+    dead-air-ms: 2000                 # silences longer than this count as dead air
+
+  - name: call-turn
+    transport: voip
+    event: call-turn
+    codec: json                       # turn-body: json (the default) — the audio rides as base64 WAV
+
+  - name: call-dtmf
+    transport: voip
+    event: call-dtmf
+    codec: json
+
+  - name: call-hangup
+    transport: voip
+    event: call-hangup
+    codec: json
+
+  # ---- what the flow does to the call -----------------------------------------------------------
+
+  # Synchronous: the task completes when the audio has played (or the caller interrupted it).
+  # Body: { callId, audio: { data: <base64>, format: <media type> } } — a model's spoken answer as is.
+  - name: play
+    direction: outbound
+    transport: voip
+    bind: "voip://play"
+    ack-mode: on-complete
+
+  # { callId, target } — the target is an extension or SIP URI on the PBX.
+  - name: transfer
+    direction: outbound
+    transport: voip
+    bind: "voip://transfer"
+
+  # { callId, reason }
+  - name: hangup
+    direction: outbound
+    transport: voip
+    bind: "voip://hangup"
+
+  # ---- the models ---------------------------------------------------------------------------------
+
+  # The responder: hears the caller's audio and answers in audio. Only an audio-native candidate
+  # is acceptable — `require: [audio-understanding]` skips any that would flatten the voice to text.
+  - name: voice-model
+    direction: outbound
+    transport: llm
+    bind: "llm://voice-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-audio-voice-stub      # the stub speaks a longer answer for a `voice` model id
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+      require: [audio-understanding]
+      output-voice: alloy
+      max-output-tokens: 200
+      timeout-seconds: 30
+
+  # Post-call analysis: the customer's turns, as audio, to a model that hears emotion and tone;
+  # the answer is a JSON object (the request says `json: true`), parsed into the reply's `json`.
+  - name: analytics-model
+    direction: outbound
+    transport: llm
+    bind: "llm://analytics-model"
+    ack-mode: on-complete
+    llm:
+      candidates:
+        - provider: openai
+          model: gpt-audio-analytics-stub
+          base-url: http://model-stub:8000/v1
+          api-key: env:LLM_API_KEY
+      require: [audio-understanding, json-output]
+      max-output-tokens: 800
+      timeout-seconds: 60

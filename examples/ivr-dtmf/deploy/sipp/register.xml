@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!--
+  An extension registering with the PBX: REGISTER sip:[service]@pbx (sipp ... -s <extension>
+  -au <extension> -ap <password> <pbx>:5060), answering the digest challenge. extension.sh runs
+  it once, then answers calls from the same port.
+-->
+<scenario name="register">
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:pbx SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[service]@pbx>;tag=[pid]Reg[call_number]
+      To: <sip:[service]@pbx>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port]>
+      Expires: 3600
+      Max-Forwards: 70
+      Content-Length: 0
+    ]]>
+  </send>
+  <recv response="401" auth="true" optional="true" next="1"/>
+  <recv response="407" auth="true" optional="true" next="1"/>
+  <recv response="200" next="2"/>
+  <label id="1"/>
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:pbx SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[service]@pbx>;tag=[pid]Reg[call_number]
+      To: <sip:[service]@pbx>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port]>
+      [authentication]
+      Expires: 3600
+      Max-Forwards: 70
+      Content-Length: 0
+    ]]>
+  </send>
+  <recv response="200"/>
+  <label id="2"/>
+</scenario>

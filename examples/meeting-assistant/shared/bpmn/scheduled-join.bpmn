@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A STANDING MEETING, JOINED ON SCHEDULE. A timer start fires every Monday at 09:00 UTC; the
+  process reads the standing meeting `schedule:weekly-review` from the `meetings` store (the same
+  request a caller would POST to /channels/join: meetingId, title, dialIn, pin, participants) and,
+  when one is stored, hands it to meeting-call through the in-process `join-scheduled` channel.
+  Nothing stored, nothing dialled.
+
+  To schedule one, write the item (e.g. with a one-off flow, or straight into the store's table);
+  to change the cadence, change the timeCycle. Each meeting needs its own meetingId per occurrence
+  (meeting-call refuses a second call for a meetingId that is still in progress), so the stored
+  request's meetingId is suffixed with the date here.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:q="urn:sutra:q:1.0"
+                  id="Definitions_scheduled_join"
+                  targetNamespace="urn:sutra:module:meeting-assistant:1.0.0">
+
+  <bpmn:dataStore id="meetingsStore" name="meetings"/>
+
+  <bpmn:process id="scheduled-join" name="Join a standing meeting on schedule" isExecutable="true">
+    <bpmn:extensionElements>
+      <q:audit capture="metadata"/>
+    </bpmn:extensionElements>
+
+    <bpmn:dataObject id="doStanding" name="standing"/>
+    <bpmn:dataStoreReference id="dsrStanding" name="meetings" dataStoreRef="meetingsStore">
+      <bpmn:extensionElements><q:store key="&quot;schedule:weekly-review&quot;"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
+
+    <bpmn:startEvent id="Start" name="Monday 09:00 UTC">
+      <bpmn:outgoing>F_start</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeCycle>R/2026-11-02T09:00:00Z/P7D</bpmn:timeCycle></bpmn:timerEventDefinition>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="Read"/>
+
+    <bpmn:serviceTask id="Read" name="The standing meeting">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_read</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrStanding</bpmn:sourceRef>
+        <bpmn:targetRef>doStanding</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_read" sourceRef="Read" targetRef="Scheduled"/>
+
+    <bpmn:exclusiveGateway id="Scheduled" name="One stored?" default="F_none">
+      <bpmn:incoming>F_read</bpmn:incoming>
+      <bpmn:outgoing>F_some</bpmn:outgoing>
+      <bpmn:outgoing>F_none</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_some" name="yes" sourceRef="Scheduled" targetRef="Prep">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">standing != null</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_none" sourceRef="Scheduled" targetRef="Nothing"/>
+    <bpmn:endEvent id="Nothing" name="Nothing scheduled"><bpmn:incoming>F_none</bpmn:incoming></bpmn:endEvent>
+
+    <bpmn:serviceTask id="Prep" name="This occurrence (FEEL)">
+      <bpmn:incoming>F_some</bpmn:incoming><bpmn:outgoing>F_prep</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{meetingId: standing.meetingId + "-" + string(today()), title: standing.title, dialIn: standing.dialIn, pin: standing.pin, participants: standing.participants, analysis: standing.analysis}</bpmn:from>
+          <bpmn:to>responseObject</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep" sourceRef="Prep" targetRef="Hand"/>
+    <bpmn:sendTask id="Hand" name="Join it">
+      <bpmn:extensionElements><q:send channel="schedule-join"/></bpmn:extensionElements>
+      <bpmn:incoming>F_prep</bpmn:incoming><bpmn:outgoing>F_handed</bpmn:outgoing>
+    </bpmn:sendTask>
+    <bpmn:sequenceFlow id="F_handed" sourceRef="Hand" targetRef="End"/>
+    <bpmn:endEvent id="End" name="Handed over"><bpmn:incoming>F_handed</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>
