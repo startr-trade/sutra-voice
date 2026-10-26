@@ -9,7 +9,9 @@ name: CI
 #   make test      → cargo test --workspace                      (tier-1, no Docker)
 #   make audit     → cargo audit + cargo deny check   (rust/deny.toml, rust/.cargo/audit.toml)
 #                    + the same two over the WebRTC worker's own lockfile
-#   book           → scripts/docs-pele.sh --check + mdbook build docs
+#
+# The book is built and checked by docs.yml, on every change under docs/, as in the engine
+# repository; this gate is code only.
 #
 # THIS RUN IS RELEASE GATE 1. release.yml refuses to publish anything from a commit whose ci.yml
 # run did not succeed (scripts/release-ci-gate.sh), so every job here is also a release gate.
@@ -46,9 +48,6 @@ env:
   # hold it (see the engine's ci.yml). Panics still name the failing test.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  # Pinned so a book that builds locally builds identically here (the same mdBook as the engine's
-  # book). The diagrams need no preprocessor: Pele draws them in the browser.
-  MDBOOK_VERSION: "0.5.4"
 
 jobs:
   fmt:
@@ -141,22 +140,3 @@ jobs:
       - name: worker supply chain (cargo deny + cargo audit)
         working-directory: tools/sutra-webrtc-worker
         run: cargo deny check && cargo audit
-
-  book:
-    name: book (Pele check + mdbook build)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      # No submodule: the book stands alone and links the engine book by URL.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - name: The committed Pele build is the pinned one
-        run: scripts/docs-pele.sh --check
-      - name: Install mdBook
-        run: |
-          set -eu
-          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: mdbook build
-        run: mdbook build docs -d "$RUNNER_TEMP/book"

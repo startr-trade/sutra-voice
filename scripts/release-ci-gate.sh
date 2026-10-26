@@ -10,8 +10,8 @@
 #
 # WHY. A tag is only a name for a commit. Nothing stops one being pushed while CI is still running,
 # or after CI has failed, and release.yml then builds and pushes both images from that tree. The
-# release is therefore gated on the CI run that already exists for the commit — fmt, lint, tier 1,
-# audit and the book — rather than on a re-run of part of it, so the answer cannot disagree with
+# release is therefore gated on the CI run that already exists for the commit — fmt, lint, tier 1
+# and audit — rather than on a re-run of part of it, so the answer cannot disagree with
 # what the repository's own CI reports.
 #
 # GITHUB_SHA is passed EXPLICITLY by the workflow rather than taken from the ambient environment:
