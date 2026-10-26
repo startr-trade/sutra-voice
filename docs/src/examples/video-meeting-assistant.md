@@ -47,7 +47,7 @@ echo "the bot is in the room"
 ```
 
 ```text
-packaged examples/video-meeting-assistant/deploy/deployments/video-stub.sutra (deploymentId dep-95e23452310d1a4d9c8c361b)
+packaged examples/video-meeting-assistant/deploy/deployments/video-stub.sutra (deploymentId dep-5b4edf77ce8251f956940453)
 the bot is in the room
 ```
 
@@ -84,8 +84,8 @@ print("analysis:", a["channel"], a["provider"], a["model"], "results=%s failed=%
 ```
 
 ```text
-Sam external segmented=True analysed=True policy=analysed segments=4 emotion=interested engagement=high disagreements=0
 Alex staff segmented=False analysed=False policy=staff-not-opted-in segments=0 emotion=None engagement=None disagreements=0
+Sam external segmented=True analysed=True policy=analysed segments=4 emotion=interested engagement=high disagreements=0
 analysis: video-analysis gemini gemini-video-stub results=4 failed=0
 ```
 
@@ -107,9 +107,9 @@ print("removedKeys:", a["removedKeys"], "unsupportedClaims:", a["unsupportedClai
 
 ```text
 segment 1 0 - 5000 ms: complete analysed
-audio: standup-1792999662554/segments/p1/1.wav.sealed 6bfa0359981a4588
-frames: ['p1/1-f1.jpg.sealed', 'p1/1-f2.jpg.sealed', 'p1/1-f3.jpg.sealed', 'p1/1-f4.jpg.sealed', 'p1/1-f5.jpg.sealed', 'p1/1-f6.jpg.sealed', 'p1/1-f7.jpg.sealed']
-the model saw: {'audio': True, 'frames': 7}
+audio: standup-1793000726015/segments/p2/1.wav.sealed d230f38962afbd98
+frames: ['p2/1-f1.jpg.sealed', 'p2/1-f2.jpg.sealed', 'p2/1-f3.jpg.sealed', 'p2/1-f4.jpg.sealed', 'p2/1-f5.jpg.sealed', 'p2/1-f6.jpg.sealed', 'p2/1-f7.jpg.sealed', 'p2/1-f8.jpg.sealed']
+the model saw: {'audio': True, 'frames': 8}
 emotion: {"confidence": 0.6, "label": "interested", "modalities": {"body": true, "face": true, "voice": true, "words": true}}
 disagreement: {"detail": null, "flagged": false}
 removedKeys: ['audioSeen', 'framesSeen'] unsupportedClaims: []
@@ -120,7 +120,7 @@ SHA-256, opened it and sent it: the stub counts the frames and the audio it rece
 own bookkeeping keys (`framesSeen`, `audioSeen`) are not fields the flow asked for, so they are
 dropped and listed, as an inferred age or identity would be.
 
-**5. The segments in the bucket:** Sam's only (participant `p1` in this run: indexes follow the
+**5. The segments in the bucket:** Sam's only (participant `p2` in this run: indexes follow the
 order people joined); Alex's media was never written as a segment.
 
 ```bash
@@ -133,32 +133,32 @@ p1.wav.sealed
 p1.wav.sealed.json
 p2.wav.sealed
 p2.wav.sealed.json
-segments/p1/1-f1.jpg.sealed
-segments/p1/1-f2.jpg.sealed
-segments/p1/1-f3.jpg.sealed
-segments/p1/1-f4.jpg.sealed
-segments/p1/1-f5.jpg.sealed
-segments/p1/1-f6.jpg.sealed
-segments/p1/1-f7.jpg.sealed
-segments/p1/1.wav.sealed
-segments/p1/2-f1.jpg.sealed
-segments/p1/2-f2.jpg.sealed
-segments/p1/2-f3.jpg.sealed
-segments/p1/2-f4.jpg.sealed
-segments/p1/2-f5.jpg.sealed
-segments/p1/2-f6.jpg.sealed
-segments/p1/2-f7.jpg.sealed
-segments/p1/2.wav.sealed
-segments/p1/3-f1.jpg.sealed
-segments/p1/3-f2.jpg.sealed
-segments/p1/3-f3.jpg.sealed
-segments/p1/3-f4.jpg.sealed
-segments/p1/3-f5.jpg.sealed
-segments/p1/3-f6.jpg.sealed
-segments/p1/3.wav.sealed
-segments/p1/4-f1.jpg.sealed
-segments/p1/4-f2.jpg.sealed
-segments/p1/4.wav.sealed
+segments/p2/1-f1.jpg.sealed
+segments/p2/1-f2.jpg.sealed
+segments/p2/1-f3.jpg.sealed
+segments/p2/1-f4.jpg.sealed
+segments/p2/1-f5.jpg.sealed
+segments/p2/1-f6.jpg.sealed
+segments/p2/1-f7.jpg.sealed
+segments/p2/1-f8.jpg.sealed
+segments/p2/1.wav.sealed
+segments/p2/2-f1.jpg.sealed
+segments/p2/2-f2.jpg.sealed
+segments/p2/2-f3.jpg.sealed
+segments/p2/2-f4.jpg.sealed
+segments/p2/2-f5.jpg.sealed
+segments/p2/2-f6.jpg.sealed
+segments/p2/2.wav.sealed
+segments/p2/3-f1.jpg.sealed
+segments/p2/3-f2.jpg.sealed
+segments/p2/3-f3.jpg.sealed
+segments/p2/3-f4.jpg.sealed
+segments/p2/3-f5.jpg.sealed
+segments/p2/3-f6.jpg.sealed
+segments/p2/3.wav.sealed
+segments/p2/4-f1.jpg.sealed
+segments/p2/4-f2.jpg.sealed
+segments/p2/4.wav.sealed
 ```
 
 Each participant's recording (`p1.wav.sealed`, `p2.wav.sealed`) with its manifest, and Sam's
@@ -173,10 +173,10 @@ import json, sys; print(json.load(sys.stdin)["report"])' | sed -n '/## Participa
 
 ```text
 ## Participants
-- P1 Sam (external): about 5940 ms of speech, 2 transcript segments; analysed over 4 segments — mostly interested, engagement high, 0 segments where voice, face and words disagreed.
-  Recording: s3://meeting-recordings/sessions/default/video-meeting-assistant/1.0.0/standup-1792999662554/p1.wav.sealed (SHA-256 64b96fd537d3f71cb938f13a7c128035fa4acb224bc6110b342c04699131480a)
-- P2 Alex (staff): about 5920 ms of speech, 2 transcript segments; not analysed (staff-not-opted-in).
-  Recording: s3://meeting-recordings/sessions/default/video-meeting-assistant/1.0.0/standup-1792999662554/p2.wav.sealed (SHA-256 23edee4cdead0aa0c9a16ff8aeb9574e7e486c9dcd43d27c82434e66aed17f3d)
+- P1 Alex (staff): about 5940 ms of speech, 2 transcript segments; not analysed (staff-not-opted-in).
+  Recording: s3://meeting-recordings/sessions/default/video-meeting-assistant/1.0.0/standup-1793000726015/p1.wav.sealed (SHA-256 f4a7f8732dca24685bd6d90aa4f83fa0c4c3dd13a2ca4603794dcc9125835e94)
+- P2 Sam (external): about 5940 ms of speech, 2 transcript segments; analysed over 4 segments — mostly interested, engagement high, 0 segments where voice, face and words disagreed.
+  Recording: s3://meeting-recordings/sessions/default/video-meeting-assistant/1.0.0/standup-1793000726015/p2.wav.sealed (SHA-256 787e03527cfba86a29afbffc4727a89d3a947095c71350a4a216b1447881228c)
 
 ## How this was produced
 ```
