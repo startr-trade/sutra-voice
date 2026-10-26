@@ -1,0 +1,13 @@
+# Keep the two templates above as the only issue forms, and point everything else
+# somewhere better than a blank issue.
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/startr-trade/sutra-voice/discussions
+    about: Usage questions, design discussion, and "is this a bug?" — start here.
+  - name: Security vulnerability
+    url: https://github.com/startr-trade/sutra-voice/security/policy
+    about: Do NOT open a public issue. Report privately — see SECURITY.md.
+  - name: Engine bug or feature
+    url: https://github.com/startr-trade/sutra/issues
+    about: BPMN execution, channels, persistence or the model adapters belong to the engine.

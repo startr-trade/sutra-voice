@@ -21,6 +21,8 @@
 /Makefile                               @startr-trade/sutra-maintainers
 /scripts/                               @startr-trade/sutra-maintainers
 
-# --- Licensing ---------------------------------------------------------------------------
+# --- Licensing and policy --------------------------------------------------------------
 /LICENSE-MIT                            @startr-trade/sutra-maintainers
 /LICENSE-APACHE                         @startr-trade/sutra-maintainers
+/SECURITY.md                            @startr-trade/sutra-maintainers
+/CODE_OF_CONDUCT.md                     @startr-trade/sutra-maintainers

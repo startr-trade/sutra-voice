@@ -106,6 +106,13 @@ Before anything is built, the tag must pass four gates; each is a script you can
 
 So the order is: the engine tag exists → the pin names it → CI is green on the commit → tag it.
 
+## Contributing and security
+
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). Questions and ideas go to
+[Discussions](https://github.com/startr-trade/sutra-voice/discussions). Report vulnerabilities
+privately, as [SECURITY.md](SECURITY.md) describes, never in a public issue.
+
 ## License
 
 Dual-licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or

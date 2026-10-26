@@ -1,0 +1,60 @@
+name: Bug report
+description: Something does not work the way it is documented to work.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first — including closed ones.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        1. …
+        2. …
+        Expected: …
+        Actual: …
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: >
+        The smallest thing that shows the problem — a BPMN/DMN snippet, a failing test, the
+        channel configuration, a SIPp scenario, or a link to a repository. Bugs with a reproducer get fixed first.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "The sutra-voice image tag or commit, and the engine version it pins."
+      placeholder: "ghcr.io/startr-trade/sutra-voice:0.6.0 (engine v0.6.0)"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + architecture, how you run Sutra Voice, and the PBX / SFU (product and version).
+      placeholder: "Ubuntu 24.04 x86_64, docker compose, rustpbx 0.5.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Relevant output. `RUST_LOG=debug` gives much more detail.
+        Please redact secrets, tokens, phone numbers and any real call content.
+      render: text
+    validations:
+      required: false
