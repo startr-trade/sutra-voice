@@ -14,6 +14,11 @@ sutra-transport-spi = { workspace = true }
 sutra-llm-spi = { workspace = true }
 sutra-objectstore = { workspace = true }
 sutra-crypto = { workspace = true }
+# Streamed recordings: S3 multipart uploads (signed with sutra-objectstore's SigV4), the stored
+# object's SHA-256, and the HMAC of the per-call bridge tokens. Same versions as the engine's.
+reqwest = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
 axum = { version = "0.8", default-features = false, features = ["ws", "query", "tokio", "http1"] }
 # Handshake only: the RWI client opens its own TCP (and, for `wss://`, TLS) stream and hands it
 # to `client_async` — the same rustls + ring + native-roots build the HTTPS client uses.

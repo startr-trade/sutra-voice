@@ -21,6 +21,10 @@ channels:
     pool-call-key: header.x-call-id   # one slot per call
     session-end:
       on-message: call-hangup         # the hang-up frees the line; the instance runs on
+    # Recorded once the greeting — which says the call is recorded — has played to the end (the
+    # flow marks that play `consent: true`); a greeting the caller talks over records nothing.
+    # The hang-up carries the recording's reference (`recording`), never the audio.
+    record: after-consent
     # Turn detection (energy VAD) for calls to this number.
     silence-ms: 700                   # this much silence ends a turn
     max-turn-ms: 30000                # a turn never runs longer

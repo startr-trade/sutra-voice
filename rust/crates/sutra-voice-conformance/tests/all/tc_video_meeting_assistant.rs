@@ -610,9 +610,11 @@ async fn tc_video_meeting_assistant_streams_records_transcribes_and_analyses_per
             &format!("SELECT count(*) FROM audit_event WHERE payload_json LIKE '%{sha256}%'"),
         );
         assert_ne!(audited, "0", "the audit trail carries {sha256}");
-        let (_, wav) =
-            sutra_objectstore::sealed::open(&kek, key, &stored).expect("opens with the KEK");
-        assert_eq!(&wav[..4], b"RIFF");
+        let opened = sutra_transport_voip::recording::open_stream(&kek, key, &stored)
+            .expect("opens with the KEK");
+        assert!(opened.complete, "the recording verifies to its final frame");
+        assert_eq!(reference["complete"], true);
+        assert_eq!(&opened.plaintext[..4], b"RIFF");
         let duration = reference["durationMs"].as_u64().unwrap();
         assert!((10_000..=30_000).contains(&duration), "{reference}");
     }

@@ -173,8 +173,14 @@ impl Default for VideoPolicy {
 pub struct SessionSettings {
     /// `mode: listen` — no turns are cut (a tagged session is listen-only regardless).
     pub listen_only: bool,
-    /// `record: true` — record the audio (per participant in a tagged session).
+    /// `record: true` / `record: after-consent` — record the audio (per participant in a
+    /// tagged session).
     pub record: bool,
+    /// `record: after-consent` — the recording starts only once consent is given: a `play`
+    /// marked `consent: true` played to the end, or a `record-start` naming consent.
+    /// `record: true` records from the moment the media connects, and leaves consent to the
+    /// deployment (an announcement the PBX plays before the call reaches the engine, say).
+    pub record_after_consent: bool,
     pub video: VideoPolicy,
 }
 
@@ -223,9 +229,24 @@ impl SessionSettings {
         if let Some(extra) = bool_property(definition, "video.extra-frames")? {
             video.extra_frames = extra;
         }
+        let (record, record_after_consent) = match property(definition, "record") {
+            Some(v) if v.eq_ignore_ascii_case("after-consent") => (true, true),
+            _ => (
+                bool_property(definition, "record")
+                    .map_err(|_| {
+                        invalid(
+                            definition,
+                            "'record' must be true, false or after-consent".to_string(),
+                        )
+                    })?
+                    .unwrap_or(false),
+                false,
+            ),
+        };
         Ok(SessionSettings {
             listen_only,
-            record: bool_property(definition, "record")?.unwrap_or(false),
+            record,
+            record_after_consent,
             video,
         })
     }
@@ -579,11 +600,7 @@ impl MeetingParticipant {
         let rate = u64::from(self.audio.rate.max(1));
         let from = start_ms.saturating_sub(self.joined_at_ms) * rate / 1000;
         let to = end_ms.saturating_sub(self.joined_at_ms) * rate / 1000;
-        let (from, to) = (
-            (from as usize).min(self.audio.tap.len()),
-            (to as usize).min(self.audio.tap.len()),
-        );
-        self.audio.tap[from..to].to_vec()
+        self.audio.tap_between(from, to).to_vec()
     }
 }
 
@@ -592,6 +609,10 @@ pub struct MeetingState {
     started: Instant,
     pub rate: u32,
     pub record: bool,
+    /// The recordings wait for consent (`record: after-consent`).
+    pub record_after_consent: bool,
+    /// A `record-start` started the recordings.
+    pub record_started: bool,
     pub video: VideoPolicy,
     pub participants: BTreeMap<u16, MeetingParticipant>,
     pub ids: HashMap<String, u16>,
@@ -619,6 +640,8 @@ impl MeetingState {
             started: Instant::now(),
             rate,
             record,
+            record_after_consent: false,
+            record_started: false,
             video,
             participants: BTreeMap::new(),
             ids: HashMap::new(),

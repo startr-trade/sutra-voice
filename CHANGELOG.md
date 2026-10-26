@@ -19,6 +19,50 @@ telephony and video, and this repository adds them through the engine's transpor
 
 Voice, meeting and video support is a **preview** in this release.
 
+> **PREVIEW.** Everything in this release — voice calls, IVR, meetings and video — is a
+> preview: the channel keys, the media protocol, the `voip://` operations and the recording
+> format may still change in a minor release.
+
+### Added — durable recordings, consent, credentials out of URLs, toll-fraud controls (PREVIEW)
+
+- **Recordings stream to the store while the call is up** (no longer held in memory until the
+  hang-up): an S3 multipart upload in 5 MiB parts, each one-second chunk sealed on its own
+  (`sutra-sealed-stream-1`: a fresh data key per recording, wrapped under the engine's
+  envelope-encryption KEK; each frame authenticated with its index, the object key and whether it
+  is the last), so a truncated object verifies up to its last good chunk and reads as incomplete.
+  Memory per recording is bounded by one part. Parts in progress are spooled to disk, sealed
+  (`SUTRA_VOIP_RECORDING_SPOOL_DIR`). The media reference gains `complete`, `startMs` and
+  `encryption.scheme: "sutra-sealed-stream-1"`. `sutra_transport_voip::recording::open_stream`
+  reads a recording back.
+- **Crash recovery**: a sweep at start-up and every `SUTRA_VOIP_RECORDING_SWEEP_SECONDS` (600)
+  completes the uploads an earlier run left (uploading what the spool still held), verifies them
+  frame by frame, amends each recording's manifest (`<key>.json`: `complete: false`, the captured
+  duration, the stored object's SHA-256) and delivers the reference on the call's `call-hangup`
+  channel (`reason: "recording-recovered"`, `recovered: true`) so the process's audit trail
+  records it. `SUTRA_VOIP_INSTANCE_ID` names the writer (default `HOSTNAME`).
+- **Recording inbound calls, behind consent**: `record: after-consent` on a `call-start` channel
+  starts the recording only once an announcement marked `consent: true` has played to the end;
+  `record: true` records from the moment the media connects and leaves consent to the deployment
+  (an announcement the PBX plays first). New operations **`voip://record-start`** — refused with
+  `SUTRA.VOIP.CONSENT_REQUIRED` until consent is given (that announcement, or the request saying
+  `consent: true`) — and **`voip://record-stop`** (answers the reference). The hang-up carries
+  every recording of the call in `recordings`. The voice-assistant example records its inbound
+  calls after the greeting.
+- **No credential in a media URL**: the PCM bridge URL a PBX is handed carries a token minted for
+  that one call (HMAC-SHA256 over the call id, expiry and a nonce; valid
+  `SUTRA_VOIP_BRIDGE_TOKEN_TTL_SECONDS`, 60; good for one socket) instead of the media token,
+  which a bridge socket no longer accepts in its URL. The media stream (`/voip/stream`) takes the
+  media token only as `Authorization: Bearer` — a `?token=` is refused — and the WebRTC worker
+  sends it so. Logged URLs and gateway errors have their tokens redacted.
+- **Toll-fraud controls on `voip://originate`**: nothing is dialled until
+  `SUTRA_VOIP_ORIGINATE_ALLOW` lists what may be (glob patterns over the number and the SIP URI;
+  **deny-all by default**); premium-rate prefixes (`SUTRA_VOIP_ORIGINATE_BLOCK_PREFIXES`, a
+  built-in list) and international numbers (outside `SUTRA_VOIP_ORIGINATE_HOME_PREFIX`) are
+  refused unless named specifically or switched on (`_ALLOW_PREMIUM`, `_ALLOW_INTERNATIONAL`);
+  rate limits per destination (`_RATE_PER_DESTINATION`, 10 an hour) and overall
+  (`_RATE_GLOBAL`, 60 a minute). Every refusal is a diagnostic (`SUTRA.VOIP.ORIGINATE_REFUSED`,
+  or the retryable `SUTRA.VOIP.ORIGINATE_RATE_LIMITED`) and a `sutra.audit` log event.
+
 ### Added — the repository
 
 - **`sutra-voice-dist`** → the `sutra-voice-engine` binary and image: the engine's default
@@ -47,7 +91,7 @@ Voice, meeting and video support is a **preview** in this release.
   declares `meeting-transcription` and `video-analysis` (live: OpenAI Realtime then Gemini Live;
   `gemini-2.5-flash` then `gemini-2.5-flash-lite`).
 
-### Added — video meetings: a WebRTC media worker, per-participant sessions, segment analysis
+### Added — video meetings: a WebRTC media worker, per-participant sessions, segment analysis (PREVIEW)
 
 - **`sutra-webrtc-worker`** (`tools/sutra-webrtc-worker`, its own Cargo workspace and image —
   the engine never links libwebrtc): joins a LiveKit room as a visible participant, subscribes to
@@ -85,7 +129,7 @@ Voice, meeting and video support is a **preview** in this release.
   analysis echoing the frames and audio it received).
 - **Tests**: tier 2 — `tc_video_meeting_assistant_`.
 
-### Added — the meeting assistant: listen-only calls, recordings, live transcription
+### Added — the meeting assistant: listen-only calls, recordings, live transcription (PREVIEW)
 
 - **`voip` listen-only calls.** `voip://originate` takes `mode: "listen"` (no turns, no barge-in)
   and `dtmfAfterAnswer`; `voip://dtmf` paces its digits (`gapMs`, default 250) and no longer
@@ -114,7 +158,7 @@ Voice, meeting and video support is a **preview** in this release.
   in-memory store, recording settings, both example variants linted; tier 2 —
   `tc_meeting_assistant_joins_records_transcribes_and_reports`.
 
-### Added — voice calls: the `voip` transport and the voice-assistant example
+### Added — voice calls and IVR: the `voip` transport, the voice-assistant and ivr-dtmf examples (PREVIEW)
 
 - **`voip` transport** (`sutra-transport-voip`, linked into `sutra-voice-engine`). Turn-based
   phone and VoIP calls driven by a flow, through a media gateway that transcodes at the edge —

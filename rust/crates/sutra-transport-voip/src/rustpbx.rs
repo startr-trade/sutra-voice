@@ -365,7 +365,7 @@ async fn connection_loop(shared: Arc<RwiShared>) {
                 serve_connection(&shared, socket, &mut stop).await;
             }
             Err(error) => {
-                tracing::warn!(url = %shared.settings.url, "RWI connect failed: {error}");
+                tracing::warn!(url = %crate::tokens::redact_url(&shared.settings.url), "RWI connect failed: {}", crate::tokens::redact_tokens(&error));
             }
         }
         // Down: fail every in-flight command so callers retry.

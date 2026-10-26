@@ -218,6 +218,16 @@ fn boot() -> Voice {
             format!("ws://{engine_name}:8080"),
         )
         .env("SUTRA_VOIP_TRUNK", "carrier")
+        .env("SUTRA_VOIP_ORIGINATE_ALLOW", "+1555*")
+        .env("SUTRA_VOIP_ORIGINATE_HOME_PREFIX", "+1")
+        // The suites call the same numbers many times over.
+        .env("SUTRA_VOIP_ORIGINATE_RATE_PER_DESTINATION", "0")
+        .env(
+            "SUTRA_VOIP_RECORDING_STORE",
+            "memory://voice-recordings/calls",
+        )
+        .env("SUTRA_VOIP_RECORDING_KEK", "env:RECORDINGS_KEK")
+        .env("RECORDINGS_KEK", "a test recordings kek")
         .env("PBX_RWI_TOKEN", RWI_TOKEN)
         .env("VOIP_MEDIA_TOKEN", MEDIA_TOKEN)
         .env("VOICE_API_KEY", API_KEY)
@@ -578,6 +588,27 @@ async fn tc_voice_inbound_call_is_answered_recorded_and_a_repeat_is_recognised()
         "the turn is the 1.5 s utterance ({speech} ms)"
     );
     assert_eq!(record["hangupBy"], "caller", "{record}");
+    // RECORDED AFTER CONSENT: the greeting announced the recording and played to the end, so
+    // the call-start channel's `record: after-consent` started it then; the hang-up carried
+    // the sealed recording's reference into the interaction record.
+    let recording = &record["recording"];
+    assert_eq!(recording["kind"], "media", "{record}");
+    assert_eq!(recording["complete"], true, "{recording}");
+    assert_eq!(recording["consentAnnounced"], true, "{recording}");
+    assert_eq!(recording["encryption"]["scheme"], "sutra-sealed-stream-1");
+    let start_ms = recording["startMs"].as_u64().unwrap();
+    assert!(
+        start_ms > 0 && recording["consentAnnouncedAtMs"].as_i64().unwrap() <= 0,
+        "the recording began after the greeting announced it: {recording}"
+    );
+    assert!(
+        recording["durationMs"].as_u64().unwrap() >= 1500,
+        "the recording holds the caller's turn: {recording}"
+    );
+    assert!(recording["uri"]
+        .as_str()
+        .unwrap()
+        .starts_with("memory://voice-recordings/calls/default/voice-assistant/"));
     assert!(
         store_items(voice, "interactions", "conversation:").is_empty(),
         "the conversation stays in the call's own instance, not in the store"

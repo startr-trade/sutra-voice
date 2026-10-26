@@ -2,13 +2,24 @@
 //!
 //! | Route | What |
 //! |---|---|
-//! | `GET /voip/stream?token=…` | the generic media-stream protocol (WebSocket) |
-//! | `GET /voip/bridge?token=…&call_id=…&samplerate=…` | the PCM bridge a PBX dials (WebSocket) |
+//! | `GET /voip/stream` + `Authorization: Bearer <media token>` | the generic media-stream protocol (WebSocket) |
+//! | `GET /voip/bridge?token=<bridge token>&call_id=…&samplerate=…` | the PCM bridge a PBX dials (WebSocket) |
 //! | `POST /voip/rustpbx/webhook?token=…` | the PBX's event tap (`call_created`, `call_hangup`, …) |
 //! | `POST /voip/rustpbx/ivr-step[/{phase}]?token=…` | the PBX's IVR step provider: answers with a bridge action to `/voip/bridge` |
 //!
-//! Every route requires the media token as a `token` query parameter (the PBX's bridge
-//! client sends no custom headers, so the URL is the only place a credential can ride).
+//! Credentials:
+//!
+//! - **the media stream** takes the media token only as an `Authorization: Bearer` header; a
+//!   token in its URL is refused (URLs end up in proxies' and servers' logs).
+//! - **the PCM bridge** is dialled by a PBX whose bridge client sends no custom headers, so its
+//!   URL carries a credential — but never the media token: a bridge token minted for that one
+//!   call when it is handed to the bridge, valid for a minute and for one socket
+//!   ([`crate::tokens`]). A client that can send headers may use `Authorization: Bearer
+//!   <media token>` instead.
+//! - **the PBX's webhook and IVR-step URLs** are static PBX configuration; they take the media
+//!   token as `Authorization: Bearer` or, for a PBX that cannot send headers, as `?token=`.
+//!
+//! No log line here carries a URL's query string.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +27,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -31,6 +42,7 @@ use crate::hub::{
 };
 use crate::protocol::{self, Framing, GenericFrame};
 use crate::rustpbx;
+use crate::tokens;
 
 /// How long a generic-protocol socket may take to send its `start` frame.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,12 +72,33 @@ fn refuse(hub: &VoipHub) -> Response {
     StatusCode::UNAUTHORIZED.into_response()
 }
 
+/// The `Authorization: Bearer` credential of a request.
+fn bearer_of(headers: &HeaderMap) -> Option<&str> {
+    tokens::bearer(
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// Whether a request carries the media token as a bearer header.
+fn bearer_ok(hub: &VoipHub, headers: &HeaderMap) -> bool {
+    bearer_of(headers).is_some_and(|token| hub.token_ok(Some(token)))
+}
+
 async fn stream_socket(
     State(hub): State<Arc<VoipHub>>,
     Query(params): Params,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !hub.token_ok(params.get("token").map(String::as_str)) {
+    if params.contains_key("token") {
+        tracing::warn!(
+            "voip: media-stream request refused — a token in the URL is not accepted; send it as `Authorization: Bearer`"
+        );
+        return refuse(&hub);
+    }
+    if !bearer_ok(&hub, &headers) {
         return refuse(&hub);
     }
     upgrade.on_upgrade(move |socket| serve_generic(hub, socket))
@@ -74,10 +107,23 @@ async fn stream_socket(
 async fn bridge_socket(
     State(hub): State<Arc<VoipHub>>,
     Query(params): Params,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !hub.token_ok(params.get("token").map(String::as_str)) {
-        return refuse(&hub);
+    let named = params
+        .get("call_id")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !bearer_ok(&hub, &headers) {
+        if let Err(refusal) = hub.bridge_token_ok(params.get("token").map(String::as_str), named) {
+            tracing::warn!(
+                call_id = %named,
+                reason = refusal.as_str(),
+                "voip: bridge socket refused — its bridge token is {}",
+                refusal.as_str()
+            );
+            return refuse(&hub);
+        }
     }
     let rate = params
         .get(rustpbx::wire::BRIDGE_Q_SAMPLERATE)
@@ -270,12 +316,18 @@ async fn serve_generic(hub: Arc<VoipHub>, socket: WebSocket) {
     hub.media_closed(&call, reason);
 }
 
+/// The media token as a bearer header, or (for a PBX that sends no headers) as `?token=`.
+fn pbx_request_ok(hub: &VoipHub, params: &HashMap<String, String>, headers: &HeaderMap) -> bool {
+    bearer_ok(hub, headers) || hub.token_ok(params.get("token").map(String::as_str))
+}
+
 async fn webhook(
     State(hub): State<Arc<VoipHub>>,
     Query(params): Params,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !hub.token_ok(params.get("token").map(String::as_str)) {
+    if !pbx_request_ok(&hub, &params, &headers) {
         return refuse(&hub);
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
@@ -332,9 +384,10 @@ fn ivr_answer(hub: &VoipHub, body: &[u8]) -> Response {
 async fn ivr_step(
     State(hub): State<Arc<VoipHub>>,
     Query(params): Params,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !hub.token_ok(params.get("token").map(String::as_str)) {
+    if !pbx_request_ok(&hub, &params, &headers) {
         return refuse(&hub);
     }
     ivr_answer(&hub, &body)
@@ -344,9 +397,10 @@ async fn ivr_step_phase(
     State(hub): State<Arc<VoipHub>>,
     Path(phase): Path<String>,
     Query(params): Params,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !hub.token_ok(params.get("token").map(String::as_str)) {
+    if !pbx_request_ok(&hub, &params, &headers) {
         return refuse(&hub);
     }
     match phase.as_str() {

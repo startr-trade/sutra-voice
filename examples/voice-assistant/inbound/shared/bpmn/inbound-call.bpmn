@@ -124,7 +124,9 @@
       <bpmn:incoming>F_greet</bpmn:incoming><bpmn:outgoing>F_prep_greeting</bpmn:outgoing>
       <bpmn:dataInputAssociation>
         <bpmn:assignment><bpmn:from>[{role: "assistant", content: answer.transcript}]</bpmn:from><bpmn:to>history</bpmn:to></bpmn:assignment>
-        <bpmn:assignment><bpmn:from>{callId: callId, audio: answer.audio}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
+        <!-- `consent: true`: the greeting announces the recording, so once it has played to the
+             end the call-start channel's `record: after-consent` starts recording. -->
+        <bpmn:assignment><bpmn:from>{callId: callId, audio: answer.audio, consent: true}</bpmn:from><bpmn:to>requestBody</bpmn:to></bpmn:assignment>
       </bpmn:dataInputAssociation>
     </bpmn:serviceTask>
     <bpmn:sequenceFlow id="F_prep_greeting" sourceRef="PrepGreeting" targetRef="PlayGreeting"/>
@@ -411,7 +413,7 @@
       <bpmn:incoming>F_decided</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
       <bpmn:dataInputAssociation>
         <bpmn:assignment>
-          <bpmn:from>{callId: callId, caller: caller, direction: "inbound", startedAt: startedAt, endedAt: endedAt, endReason: ended.reason, hangupBy: ended.hangupBy, durationMs: ended.durationMs, transferred: transferred, turns: for t in turns return {index: t.index, bargeIn: t.bargeIn, features: t.features}, acoustic: ended.features, analyzedParties: analyzedParties, analysis: analysis, audioPreserved: audioPreserved, outcome: outcome, resolved: resolved, repeatContact: repeatContact, firstContactResolution: firstContactResolution, previousCallId: if prior = null then null else prior.lastCallId}</bpmn:from>
+          <bpmn:from>{callId: callId, caller: caller, direction: "inbound", startedAt: startedAt, endedAt: endedAt, endReason: ended.reason, hangupBy: ended.hangupBy, durationMs: ended.durationMs, transferred: transferred, turns: for t in turns return {index: t.index, bargeIn: t.bargeIn, features: t.features}, acoustic: ended.features, analyzedParties: analyzedParties, analysis: analysis, audioPreserved: audioPreserved, recording: ended.recording, outcome: outcome, resolved: resolved, repeatContact: repeatContact, firstContactResolution: firstContactResolution, previousCallId: if prior = null then null else prior.lastCallId}</bpmn:from>
           <bpmn:to>record</bpmn:to>
         </bpmn:assignment>
         <bpmn:assignment>

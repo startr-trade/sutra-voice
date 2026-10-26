@@ -21,10 +21,13 @@ use crate::codes;
 use crate::config::{CallSettings, EventKind, ModuleRoute, RouteSet, TurnBody, VoipConfig};
 use crate::features::{analyze_turn, CallAnalytics, PitchConfig};
 use crate::gateway::{GatewayControl, GatewayError, GatewayEvent, OriginateRequest};
-use crate::listen::{self, ListenState, Recorder, SpeakerTrack};
+use crate::listen::{self, ListenState, SpeakerTrack};
 use crate::meeting::{self, AnalysisPolicy, AnalysisSettings, AnalysisTiming, MeetingState};
 use crate::pacing::{frames_of, pace, PlaybackOutcome};
+use crate::policy::{OriginateGuard, Refusal};
 use crate::protocol::{self, Framing};
+use crate::recording::{Recorder, RecordingOwner};
+use crate::tokens::{BridgeTokens, TokenRefusal};
 use crate::vad::{TurnDetector, VadEvent};
 
 /// Header names on the inbound messages.
@@ -175,8 +178,14 @@ pub struct Call {
     attached: AtomicBool,
     /// A listen-only call: no turns, no barge-in (originate `mode: listen`).
     listen_only: AtomicBool,
-    /// The call's audio is recorded (the originate request was marked `capture=media`).
+    /// The call's audio is recorded (the originate request was marked `capture=media`, the
+    /// channel says `record:`, or the flow asked with `record-start`).
     record: AtomicBool,
+    /// The recording waits for consent (`record: after-consent` on the call-start channel).
+    record_after_consent: AtomicBool,
+    /// When (ms into the call) an announcement marked `consent: true` played to the end, on a
+    /// call with no media plane of its own yet (a conversation call nobody records).
+    consent_ms: Mutex<Option<u64>>,
     /// The media plane of a listen-only or recorded call, once its media is up.
     listen: Mutex<Option<ListenState>>,
     /// A meeting session (a tagged socket): every participant's media plane.
@@ -272,6 +281,10 @@ pub struct VoipHub {
     ended: Mutex<VecDeque<String>>,
     /// Where recordings go (`SUTRA_VOIP_RECORDING_STORE`).
     recorder: Option<Arc<Recorder>>,
+    /// Mints and checks the per-call bridge tokens (`None` without a media token).
+    bridge_tokens: Option<BridgeTokens>,
+    /// The toll-fraud controls on `originate`.
+    originate_guard: OriginateGuard,
     this: Weak<VoipHub>,
 }
 
@@ -359,7 +372,14 @@ impl VoipHub {
         gateway: Arc<dyn GatewayControl>,
         recorder: Option<Arc<Recorder>>,
     ) -> Arc<VoipHub> {
+        let bridge_tokens = config
+            .media_token
+            .as_deref()
+            .map(|token| BridgeTokens::new(token, config.bridge_token_ttl_seconds));
+        let originate_guard = OriginateGuard::new(config.originate.clone());
         Arc::new_cyclic(|this| VoipHub {
+            bridge_tokens,
+            originate_guard,
             config,
             intake,
             routes: RwLock::new(Arc::new(routes)),
@@ -427,12 +447,31 @@ impl VoipHub {
         }
     }
 
-    /// The bridge URL the gateway dials for `call_id`.
+    /// A bridge token for `call_id` (`""` for a bridge socket that will name no call); `None`
+    /// without a media token.
+    pub fn mint_bridge_token(&self, call_id: &str) -> Option<String> {
+        self.bridge_tokens.as_ref().map(|t| t.mint(call_id))
+    }
+
+    /// Check (and spend) a bridge socket's token for the call it names.
+    pub fn bridge_token_ok(&self, token: Option<&str>, call_id: &str) -> Result<(), TokenRefusal> {
+        match &self.bridge_tokens {
+            Some(tokens) => tokens.verify(token, call_id),
+            None => Err(TokenRefusal::Missing),
+        }
+    }
+
+    /// The bridge URL the gateway dials for `call_id`: it carries a token minted for this one
+    /// call, short-lived and good for one socket — never the media token itself.
     pub fn bridge_url(&self, call_id: Option<&str>) -> String {
         let mut url = format!(
             "{}{PATH_BRIDGE}?token={}",
             self.config.public_media_url,
-            encode_query(self.config.media_token.as_deref().unwrap_or_default())
+            encode_query(
+                &self
+                    .mint_bridge_token(call_id.unwrap_or_default())
+                    .unwrap_or_default()
+            )
         );
         if let Some(call_id) = call_id {
             url.push_str(&format!("&call_id={}", encode_query(call_id)));
@@ -476,6 +515,8 @@ impl VoipHub {
             attached: AtomicBool::new(false),
             listen_only: AtomicBool::new(false),
             record: AtomicBool::new(false),
+            record_after_consent: AtomicBool::new(false),
+            consent_ms: Mutex::new(None),
             listen: Mutex::new(None),
             meeting: Mutex::new(None),
             segment_seq: AtomicU64::new(0),
@@ -628,9 +669,11 @@ impl VoipHub {
             .as_ref()
             .map(|r| r.max_seconds)
             .unwrap_or(crate::config::DEFAULT_RECORDING_MAX_SECONDS);
-        let mut state = ListenState::new(rate, record, max_seconds);
+        let mut state =
+            ListenState::new(rate, record, max_seconds).with_window(listen::TAP_WINDOW_SECONDS);
+        state.record_after_consent = call.record_after_consent.load(Ordering::SeqCst);
         let module = lock(&call.meta).module.clone();
-        if let Some(module) = module.filter(|_| listen_only) {
+        if let Some(module) = module.clone().filter(|_| listen_only) {
             if let Some(settings) = module.transcribe.clone() {
                 let (frames, done) = listen::spawn_transcriber(
                     self.this.clone(),
@@ -645,7 +688,110 @@ impl VoipHub {
                 state.transcript = Some(done);
             }
         }
+        if record && !state.record_after_consent {
+            let owner = self.recording_owner(call);
+            let _ = self.begin_call_recording(call, owner, &mut state);
+        }
         *lock(&call.listen) = Some(state);
+    }
+
+    /// Who a recording of `call` belongs to.
+    fn recording_owner(&self, call: &Call) -> (String, RecordingOwner) {
+        let module = lock(&call.meta).module.clone();
+        let module_key = module
+            .as_ref()
+            .map(|m| m.module_key.clone())
+            .unwrap_or_default();
+        let owner = RecordingOwner {
+            call_id: call.call_id.clone(),
+            tenant: module
+                .as_ref()
+                .map(|m| m.tenant.clone())
+                .unwrap_or_default(),
+            module_key: module_key.clone(),
+            participant_id: None,
+            participant_index: None,
+        };
+        (module_key, owner)
+    }
+
+    /// Start recording a (non-meeting) call into `state`: `<call>.wav`, then `<call>-2.wav`, …
+    /// for each later `record-start`. `owner` is [`Self::recording_owner`], taken before
+    /// `state`'s lock.
+    fn begin_call_recording(
+        &self,
+        call: &Call,
+        (module_key, owner): (String, RecordingOwner),
+        state: &mut ListenState,
+    ) -> Result<(), String> {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return Err("no recording store is configured".to_string());
+        };
+        let name = match state.finished.len() {
+            0 => call.call_id.clone(),
+            n => format!("{}-{}", call.call_id, n + 1),
+        };
+        let started = state.start_recording(recorder, &module_key, &[&name], owner);
+        if let Err(e) = &started {
+            tracing::warn!(call_id = %call.call_id, "voip: the recording could not start: {e}");
+        }
+        started
+    }
+
+    /// Start the recording of every present participant of a meeting session that is due one
+    /// (recorded, and — for `after-consent` — consented) and has none.
+    fn start_participant_recordings(&self, call: &Call) {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return;
+        };
+        let (module_key, base) = self.recording_owner(call);
+        let mut guard = lock(&call.meeting);
+        let Some(state) = guard.as_mut() else { return };
+        let due = state.record
+            && (!state.record_after_consent
+                || state.consent_at_ms.is_some()
+                || state.record_started);
+        if !due {
+            return;
+        }
+        for participant in state.participants.values_mut() {
+            if participant.left_at_ms.is_some() || participant.audio.recording.is_some() {
+                continue;
+            }
+            let name = match participant.audio.finished.len() {
+                0 => format!("p{}", participant.index),
+                n => format!("p{}-{}", participant.index, n + 1),
+            };
+            let owner = RecordingOwner {
+                participant_id: Some(participant.participant_id.clone()),
+                participant_index: Some(participant.index),
+                ..base.clone()
+            };
+            if let Err(e) = participant.audio.start_recording(
+                recorder,
+                &module_key,
+                &[&call.call_id, &name],
+                owner,
+            ) {
+                tracing::warn!(call_id = %call.call_id, index = participant.index, "voip: a participant recording could not start: {e}");
+            }
+        }
+    }
+
+    /// Consent was just given on `call` (an announcement marked `consent: true` played to the
+    /// end): start the recordings that were waiting for it.
+    fn on_consent(&self, call: &Arc<Call>) {
+        if call.is_meeting() {
+            self.start_participant_recordings(call);
+            return;
+        }
+        let owner = self.recording_owner(call);
+        let mut guard = lock(&call.listen);
+        if let Some(state) = guard.as_mut() {
+            if state.record && state.record_after_consent && state.recording.is_none() {
+                let _ = self.begin_call_recording(call, owner, state);
+            }
+        }
     }
 
     /// Finish a listen-only / recorded call after its end: drain the transcriber, write the
@@ -679,14 +825,10 @@ impl VoipHub {
                 };
             }
             if state.record {
-                let module_key = lock(&call.meta)
-                    .module
-                    .as_ref()
-                    .map(|m| m.module_key.clone())
-                    .unwrap_or_default();
-                body["recording"] =
-                    listen::finish_recording(hub.recorder.as_deref(), &module_key, &call, &state)
-                        .await;
+                let (last, all) =
+                    listen::finish_recording(hub.recorder.as_deref(), &call, &mut state).await;
+                body["recording"] = last;
+                body["recordings"] = json!(all);
             }
             body["mode"] = json!(if call.is_listen_only() {
                 MODE_LISTEN
@@ -902,6 +1044,7 @@ impl VoipHub {
                 }
             }
         }
+        self.start_participant_recordings(call);
         let extra = BTreeMap::from([
             (headers::PARTICIPANT_ID.to_string(), track.participant_id),
             (headers::PARTICIPANT_EVENT.to_string(), "joined".to_string()),
@@ -1128,57 +1271,42 @@ impl VoipHub {
                 hub.run_analysis(&call, settings, inputs).await;
             }
 
-            let module_key = module
-                .as_ref()
-                .map(|m| m.module_key.clone())
-                .unwrap_or_default();
             let mut recordings = Vec::new();
             let mut participants = Vec::new();
             let tally = std::mem::take(&mut *lock(&call.analysis_tally));
-            for participant in state.participants.values() {
+            let consent_at = state.consent_at_ms;
+            for participant in state.participants.values_mut() {
                 let recording = if !state.record {
                     Value::Null
-                } else if let Some(recorder) = hub.recorder.as_deref() {
-                    let samples = participant.audio.mixed();
-                    let wav = audio::wav_wrap(&samples, state.rate);
-                    let name = format!("p{}", participant.index);
-                    match recorder
-                        .write_at(&module_key, &[&call.call_id, &name], wav)
-                        .await
-                    {
-                        Ok((stored, key_id)) => {
-                            let reference = json!({
-                                "kind": listen::MEDIA_REFERENCE_KIND,
-                                "uri": stored.uri,
-                                "sha256": stored.sha256,
-                                "bytes": stored.bytes,
-                                "durationMs": samples.len() as u64 * 1000 / u64::from(state.rate.max(1)),
-                                "format": listen::RECORDING_FORMAT,
-                                "rate": state.rate,
-                                "channels": 1,
-                                "encryption": key_id.map(|id| json!({
-                                    "scheme": "sutra-sealed-1",
-                                    "cipher": sutra_objectstore::sealed::CIPHER,
-                                    "keyId": id
-                                })),
-                                "consentAnnounced": state.consent_at_ms.is_some(),
-                                "consentAnnouncedAtMs": state.consent_at_ms,
-                                "truncated": participant.audio.truncated,
-                                "callId": call.call_id,
-                                "participantId": participant.participant_id,
-                                "participantIndex": participant.index,
-                                "startMs": participant.joined_at_ms,
-                            });
-                            recordings.push(reference.clone());
-                            reference
-                        }
-                        Err(detail) => {
-                            tracing::warn!(call_id = %call.call_id, index = participant.index, "voip: a participant recording could not be stored: {detail}");
-                            json!({"status": "failed", "detail": detail})
-                        }
-                    }
-                } else {
+                } else if hub.recorder.is_none() {
                     json!({"status": "unavailable", "detail": "no recording store is configured"})
+                } else {
+                    if let Some(pending) = participant.audio.stop_recording(&call.call_id) {
+                        let mut reference = pending.reference(&call.call_id).await;
+                        if reference["kind"] == listen::MEDIA_REFERENCE_KIND {
+                            reference["participantId"] = json!(participant.participant_id);
+                            reference["participantIndex"] = json!(participant.index);
+                            // The session's announcement, in session time.
+                            reference["consentAnnounced"] = json!(consent_at.is_some());
+                            reference["consentAnnouncedAtMs"] = json!(consent_at);
+                            reference["startMs"] = json!(
+                                participant.joined_at_ms
+                                    + reference["startMs"].as_u64().unwrap_or(0)
+                            );
+                            recordings.push(reference.clone());
+                        }
+                        participant.audio.finished.push(reference);
+                    }
+                    match participant.audio.finished.last() {
+                        Some(last) => last.clone(),
+                        None if participant.audio.recording_error.is_some() => json!({
+                            "status": "failed", "detail": participant.audio.recording_error
+                        }),
+                        None => json!({
+                            "status": "not-started",
+                            "detail": "the recording never started (consent was never given)"
+                        }),
+                    }
                 };
                 participants.push(json!({
                     "participantId": participant.participant_id,
@@ -1370,19 +1498,23 @@ impl VoipHub {
                 tracing::warn!(call_id = %call.call_id, "voip: the session is to be recorded, but no recording store is configured");
             }
             call.record.store(target.session.record, Ordering::SeqCst);
+            call.record_after_consent
+                .store(target.session.record_after_consent, Ordering::SeqCst);
             if options.tagged {
                 let max_seconds = self
                     .recorder
                     .as_ref()
                     .map(|r| r.max_seconds)
                     .unwrap_or(crate::config::DEFAULT_RECORDING_MAX_SECONDS);
-                *lock(&call.meeting) = Some(MeetingState::new(
+                let mut meeting = MeetingState::new(
                     format.rate,
                     target.session.record,
                     target.session.video.clone(),
                     target.settings.dead_air_ms,
                     max_seconds,
-                ));
+                );
+                meeting.record_after_consent = target.session.record_after_consent;
+                *lock(&call.meeting) = Some(meeting);
             }
         }
         let settings = lock(&call.meta).settings;
@@ -1648,6 +1780,7 @@ impl VoipHub {
                 let hub = self.this.clone();
                 tokio::spawn(async move {
                     if let Err(error) = gateway.bridge(&call.call_id, &url).await {
+                        let error = crate::tokens::redact_tokens(&error.to_string());
                         tracing::warn!(call_id = %call.call_id, "voip: bridging media failed: {error}");
                         if let Some(hub) = hub.upgrade() {
                             hub.progress(
@@ -1808,6 +1941,10 @@ impl VoipHub {
                     None => self.enqueue_json(call, EventKind::CallHangup, extra, body),
                 }
             }
+        } else {
+            // No hang-up goes out, but a recording in progress is still completed (not left
+            // for the sweep as if the process had crashed).
+            close_recordings(&call.call_id, listening, meeting_state);
         }
         if options.close_media {
             if let Some(link) = lock(&call.media).take() {
@@ -1853,6 +1990,7 @@ impl VoipHub {
             OpError::permanent(codes::OUTBOUND_INVALID, "originate needs a 'destination'")
         })?;
         let trunk = field(&["trunk"], "x-trunk").or_else(|| self.config.default_trunk.clone());
+        let raw_destination = destination.clone();
         let destination = sip_destination(&destination, trunk.as_deref()).ok_or_else(|| {
             OpError::permanent(
                 codes::OUTBOUND_INVALID,
@@ -1865,6 +2003,14 @@ impl VoipHub {
             .unwrap_or_else(|| mint_call_id(&message.outbox_key));
         if self.call(&call_id).is_some() {
             return Ok(json!({"callId": call_id, "status": "originating"}));
+        }
+        if let Err(refusal) = self.originate_guard.check(&raw_destination, &destination) {
+            return Err(refuse_originate(
+                module_key,
+                &call_id,
+                &raw_destination,
+                &refusal,
+            ));
         }
         let listen_only = field(&["mode"], "x-call-mode")
             .is_some_and(|m| m.trim().eq_ignore_ascii_case(MODE_LISTEN));
@@ -2018,7 +2164,10 @@ impl VoipHub {
             .unwrap_or(false);
         let hub = self.this.upgrade();
         if wait {
-            let outcome = play_paced(&call, samples, barge_in, mark, consent).await;
+            let (outcome, consented) = play_paced(&call, samples, barge_in, mark, consent).await;
+            if consented {
+                self.on_consent(&call);
+            }
             Ok(json!({
                 "callId": call.call_id,
                 "playedMs": outcome.played_ms(20),
@@ -2028,8 +2177,11 @@ impl VoipHub {
             let queued_ms = (samples.len() as u64 * 1000) / u64::from(link.format.rate.max(1));
             let call_for_task = Arc::clone(&call);
             tokio::spawn(async move {
-                let _hub = hub;
-                play_paced(&call_for_task, samples, barge_in, mark, consent).await;
+                let (_, consented) =
+                    play_paced(&call_for_task, samples, barge_in, mark, consent).await;
+                if let (true, Some(hub)) = (consented, hub) {
+                    hub.on_consent(&call_for_task);
+                }
             });
             Ok(json!({"callId": call.call_id, "queuedMs": queued_ms}))
         }
@@ -2129,6 +2281,218 @@ impl VoipHub {
         Ok(json!({"callId": call.call_id, "sent": sent}))
     }
 
+    /// `voip://record-start`: start recording the call now. Recording waits for consent: the
+    /// request is refused unless an announcement marked `consent: true` has played to the end on
+    /// the call, or the request itself says `consent: true` (the flow obtained it — the caller
+    /// pressed a key, say). A meeting session starts every present participant's recording.
+    pub async fn record_start(&self, message: &OutboundMessage) -> Result<Value, OpError> {
+        let call = match self.target_call(message)? {
+            Ok(call) => call,
+            Err(ended) => return Ok(ended),
+        };
+        if self.recorder.is_none() {
+            return Err(OpError::permanent(
+                codes::RECORDING_UNAVAILABLE,
+                format!(
+                    "record-start: no recording store is configured ({})",
+                    crate::config::ENV_RECORDING_STORE
+                ),
+            ));
+        }
+        let Some(link) = call.media() else {
+            return Err(OpError::retryable(
+                codes::CALL_NOT_CONNECTED,
+                format!("call {} has no media yet", call.call_id),
+            ));
+        };
+        let asserted = json_body(message)
+            .get("consent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let announced = lock(&call.consent_ms).is_some()
+            || lock(&call.listen)
+                .as_ref()
+                .is_some_and(|s| s.consent_at_ms.is_some())
+            || lock(&call.meeting)
+                .as_ref()
+                .is_some_and(|s| s.consent_at_ms.is_some());
+        if !asserted && !announced {
+            return Err(OpError::permanent(
+                codes::CONSENT_REQUIRED,
+                "record-start: recording needs consent first — play the announcement with                  `consent: true` (to the end), or send `consent: true` once the caller agreed",
+            ));
+        }
+        call.record.store(true, Ordering::SeqCst);
+        if call.is_meeting() {
+            if let Some(state) = lock(&call.meeting).as_mut() {
+                state.record = true;
+                state.record_started = true;
+            }
+            self.start_participant_recordings(&call);
+            return Ok(
+                json!({"callId": call.call_id, "status": "recording", "session": "meeting"}),
+            );
+        }
+        let owner = self.recording_owner(&call);
+        let consent_ms = *lock(&call.consent_ms);
+        let mut guard = lock(&call.listen);
+        let state = guard.get_or_insert_with(|| {
+            let max_seconds = self
+                .recorder
+                .as_ref()
+                .map(|r| r.max_seconds)
+                .unwrap_or(crate::config::DEFAULT_RECORDING_MAX_SECONDS);
+            let mut state = ListenState::new(link.format.rate, true, max_seconds)
+                .with_window(listen::TAP_WINDOW_SECONDS);
+            // The announcement played before this media plane existed; it is reported, at the
+            // call's clock, as before the recording began.
+            state.consent_at_ms = consent_ms.map(|_| 0);
+            state
+        });
+        state.record = true;
+        if state.recording.is_none() {
+            self.begin_call_recording(&call, owner, state)
+                .map_err(|e| OpError::retryable(codes::RECORDING_UNAVAILABLE, e))?;
+        }
+        let uri = state.recording.as_ref().map(|w| w.uri.clone());
+        let start_ms = state.recording_origin * 1000 / u64::from(state.rate.max(1));
+        Ok(json!({
+            "callId": call.call_id,
+            "status": "recording",
+            "uri": uri,
+            "startMs": start_ms,
+            "consent": if asserted { "asserted" } else { "announced" },
+        }))
+    }
+
+    /// `voip://record-stop`: stop the recording in progress and answer its media reference
+    /// (the hang-up carries every recording of the call in `recordings`).
+    pub async fn record_stop(&self, message: &OutboundMessage) -> Result<Value, OpError> {
+        let call = match self.target_call(message)? {
+            Ok(call) => call,
+            Err(ended) => return Ok(ended),
+        };
+        if call.is_meeting() {
+            let pending: Vec<(u16, String, listen::PendingRecording)> = {
+                let mut guard = lock(&call.meeting);
+                let Some(state) = guard.as_mut() else {
+                    return Ok(json!({"callId": call.call_id, "status": "ended"}));
+                };
+                state.record_started = false;
+                state.record_after_consent = true;
+                state.consent_at_ms = None;
+                state
+                    .participants
+                    .values_mut()
+                    .filter_map(|p| {
+                        p.audio
+                            .stop_recording(&call.call_id)
+                            .map(|r| (p.index, p.participant_id.clone(), r))
+                    })
+                    .collect()
+            };
+            let mut references = Vec::new();
+            for (index, id, recording) in pending {
+                let mut reference = recording.reference(&call.call_id).await;
+                reference["participantId"] = json!(id);
+                reference["participantIndex"] = json!(index);
+                if let Some(p) = lock(&call.meeting)
+                    .as_mut()
+                    .and_then(|s| s.participants.get_mut(&index))
+                {
+                    p.audio.finished.push(reference.clone());
+                }
+                references.push(reference);
+            }
+            return Ok(
+                json!({"callId": call.call_id, "status": "stopped", "recordings": references}),
+            );
+        }
+        let pending = lock(&call.listen)
+            .as_mut()
+            .and_then(|state| state.stop_recording(&call.call_id));
+        let Some(pending) = pending else {
+            return Ok(json!({"callId": call.call_id, "status": "not-recording"}));
+        };
+        let reference = pending.reference(&call.call_id).await;
+        if let Some(state) = lock(&call.listen).as_mut() {
+            state.finished.push(reference.clone());
+        }
+        Ok(json!({"callId": call.call_id, "status": "stopped", "recording": reference}))
+    }
+
+    /// Look for interrupted recordings (see [`Recorder::sweep`]) and deliver what was recovered
+    /// on each call's `call-hangup` channel, unless that call's hang-up already went out.
+    pub async fn sweep_recordings(&self) -> usize {
+        let Some(recorder) = self.recorder.clone() else {
+            return 0;
+        };
+        let recovered = recorder.sweep().await;
+        let count = recovered.len();
+        for (call_id, recordings) in crate::recording::by_call(recovered) {
+            if recordings.iter().all(|r| r.hangup_delivered) {
+                continue;
+            }
+            let owner = &recordings[0].owner;
+            let routes = self.routes();
+            let channel = routes
+                .modules
+                .get(&owner.module_key)
+                .and_then(|m| m.channel(EventKind::CallHangup).map(str::to_string));
+            let Some(channel) = channel else {
+                tracing::warn!(call_id = %call_id, module = %owner.module_key, "voip: a recovered recording's deployment has no call-hangup channel; only its manifest records it");
+                continue;
+            };
+            let references: Vec<Value> = recordings.iter().map(|r| r.reference.clone()).collect();
+            let body = json!({
+                "callId": call_id,
+                "reason": "recording-recovered",
+                "recovered": true,
+                "recording": references[0],
+                "recordings": references,
+            });
+            let message = InboundMessage {
+                tenant: owner.tenant.clone(),
+                module_key: owner.module_key.clone(),
+                channel,
+                headers: BTreeMap::from([
+                    (headers::CALL_ID.to_string(), call_id.clone()),
+                    (
+                        headers::HANGUP_REASON.to_string(),
+                        "recording-recovered".to_string(),
+                    ),
+                    (
+                        headers::GATEWAY.to_string(),
+                        self.gateway.kind().to_string(),
+                    ),
+                    (
+                        headers::CONTENT_TYPE.to_string(),
+                        "application/json".to_string(),
+                    ),
+                ]),
+                body: body.to_string().into_bytes().into(),
+                content_type: Some("application/json".to_string()),
+                idempotency_key: format!("voip:{call_id}:call-hangup:recovered"),
+                explicit_event_id: true,
+                received_at: now_rfc3339(),
+                cloud_event: None,
+            };
+            let decision = deliver_with_requeue(
+                &*self.intake,
+                &Delivery {
+                    kind: EventKind::CallHangup,
+                    message,
+                },
+            )
+            .await;
+            tracing::warn!(target: "sutra.audit", event = "VOIP_RECORDING_RECOVERED_DELIVERED", call_id = %call_id, recordings = recordings.len(), decision = ?decision, "voip: a recovered recording was delivered to its call's flow");
+            for recording in &recordings {
+                recorder.mark_delivered(&recording.key).await;
+            }
+        }
+        count
+    }
+
     /// Route an outbound operation by name.
     pub async fn operate(
         &self,
@@ -2143,10 +2507,12 @@ impl VoipHub {
             "hangup" => self.hangup(message).await,
             "transfer" => self.transfer(message).await,
             "dtmf" => self.dtmf(message).await,
+            "record-start" => self.record_start(message).await,
+            "record-stop" => self.record_stop(message).await,
             other => Err(OpError::permanent(
                 codes::OUTBOUND_INVALID,
                 format!(
-                    "unknown voip operation '{other}' (originate, play, hangup, transfer, dtmf)"
+                    "unknown voip operation '{other}' (originate, play, hangup, transfer, dtmf, record-start, record-stop)"
                 ),
             )),
         }
@@ -2200,6 +2566,60 @@ fn with_dominants(mut digest: Value) -> Value {
     digest
 }
 
+/// The refusal of an originate the toll-fraud controls stopped: an audit event, and the
+/// diagnostic the flow sees (a rate limit is retryable; the rest are not).
+fn refuse_originate(
+    module_key: Option<&str>,
+    call_id: &str,
+    destination: &str,
+    refusal: &Refusal,
+) -> OpError {
+    let masked = crate::policy::masked(destination);
+    tracing::warn!(
+        target: "sutra.audit",
+        event = "VOIP_ORIGINATE_REFUSED",
+        rule = refusal.rule(),
+        module = module_key.unwrap_or_default(),
+        call_id = %call_id,
+        destination = %masked,
+        "voip: originate refused ({}): {}",
+        refusal.rule(),
+        refusal.explain()
+    );
+    let message = format!(
+        "originate to {masked} refused ({}): {}",
+        refusal.rule(),
+        refusal.explain()
+    );
+    if refusal.is_rate_limit() {
+        OpError::retryable(codes::ORIGINATE_RATE_LIMITED, message)
+    } else {
+        OpError::permanent(codes::ORIGINATE_REFUSED, message)
+    }
+}
+
+/// Complete the recordings of a call whose end is not delivered.
+fn close_recordings(call_id: &str, listening: Option<ListenState>, meeting: Option<MeetingState>) {
+    let mut pending = Vec::new();
+    if let Some(mut state) = listening {
+        pending.extend(state.stop_recording(call_id));
+    }
+    if let Some(mut state) = meeting {
+        for participant in state.participants.values_mut() {
+            pending.extend(participant.audio.stop_recording(call_id));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let call_id = call_id.to_string();
+    tokio::spawn(async move {
+        for recording in pending {
+            let _ = recording.reference(&call_id).await;
+        }
+    });
+}
+
 /// How [`VoipHub::end_call`] ends a call.
 #[derive(Debug, Clone)]
 pub struct EndOptions {
@@ -2237,13 +2657,15 @@ impl EndOptions {
     }
 }
 
+/// Play `samples` paced; answers the outcome and whether this playback gave consent (an
+/// announcement marked `consent: true`, played to the end, the first on the call).
 async fn play_paced(
     call: &Arc<Call>,
     samples: Vec<i16>,
     barge_in: bool,
     mark: Option<String>,
     consent: bool,
-) -> PlaybackOutcome {
+) -> (PlaybackOutcome, bool) {
     let generation = call.play_generation.load(Ordering::SeqCst);
     let _turn = call.play_lock.lock().await;
     let none = PlaybackOutcome {
@@ -2252,10 +2674,10 @@ async fn play_paced(
         interrupted: true,
     };
     if call.play_generation.load(Ordering::SeqCst) != generation || call.is_ended() {
-        return none;
+        return (none, false);
     }
     let Some(link) = call.media() else {
-        return none;
+        return (none, false);
     };
     let frame_ms = 20;
     let frames: Vec<MediaOut> = frames_of(&samples, link.format.rate, frame_ms)
@@ -2265,9 +2687,17 @@ async fn play_paced(
     call.barge_in_enabled
         .store(barge_in && !call.is_listen_only(), Ordering::SeqCst);
     call.playing.store(true, Ordering::SeqCst);
+    // Where the playback starts in the call; the recording holds its chunks from there until
+    // the played audio is mixed in.
     let offset = lock(&call.listen).as_mut().map(|state| {
         state.catch_up();
-        state.tap.len()
+        let at = state.position();
+        if let Some(position) = state.recording_position(at) {
+            if let Some(writer) = state.recording.as_mut() {
+                writer.hold(position);
+            }
+        }
+        at
     });
     let session_offset = lock(&call.meeting).as_ref().map(MeetingState::elapsed_ms);
     let outcome = pace(frames, frame_ms, &link.out, || {
@@ -2275,18 +2705,32 @@ async fn play_paced(
     })
     .await;
     call.playing.store(false, Ordering::SeqCst);
+    let mut consented = false;
     if let (Some(offset), Some(state)) = (offset, lock(&call.listen).as_mut()) {
         // What was played goes into the recording where it played.
         let frame_len = (link.format.rate * frame_ms / 1000) as usize;
         let played = (outcome.frames_sent * frame_len).min(samples.len());
-        state.played.push((offset, samples[..played].to_vec()));
+        if let Some(position) = state.recording_position(offset) {
+            if let Some(writer) = state.recording.as_mut() {
+                writer.mix(position, &samples[..played]);
+            }
+        }
         if consent && !outcome.interrupted && state.consent_at_ms.is_none() {
-            state.consent_at_ms = Some(offset as u64 * 1000 / u64::from(state.rate.max(1)));
+            state.consent_at_ms = Some(offset * 1000 / u64::from(state.rate.max(1)));
+            consented = true;
         }
     }
     if let (Some(at), Some(state)) = (session_offset, lock(&call.meeting).as_mut()) {
         if consent && !outcome.interrupted && state.consent_at_ms.is_none() {
             state.consent_at_ms = Some(at);
+            consented = true;
+        }
+    }
+    if offset.is_none() && session_offset.is_none() && consent && !outcome.interrupted {
+        let mut at = lock(&call.consent_ms);
+        if at.is_none() {
+            *at = Some(call.created.elapsed().as_millis() as u64);
+            consented = true;
         }
     }
     if !outcome.interrupted && link.framing == Framing::Generic {
@@ -2297,7 +2741,7 @@ async fn play_paced(
                 .await;
         }
     }
-    outcome
+    (outcome, consented)
 }
 
 /// Whether `digits` are DTMF keys (`0-9`, `*`, `#`, `A-D`), at most 64 of them.

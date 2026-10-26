@@ -6,7 +6,51 @@ use sutra_channels::{
     load_channel_definitions, AckDecision, BoxFuture, ChannelDefinition, InboundIntake,
     InboundMessage,
 };
+use sutra_transport_voip::config::VoipConfig;
+use sutra_transport_voip::hub::VoipHub;
+use sutra_transport_voip::policy::OriginatePolicy;
 use tokio::sync::mpsc;
+
+/// The generic configuration the suites run with: any destination may be originated (the
+/// toll-fraud controls have their own tests).
+pub fn test_config(public_media_url: &str, media_token: Option<&str>) -> VoipConfig {
+    let mut config = VoipConfig::generic(public_media_url, media_token);
+    config.originate = OriginatePolicy {
+        allow_international: true,
+        ..OriginatePolicy::allowing(&["*"])
+    };
+    config
+}
+
+/// The bridge URL a PBX would be handed for `call_id` (a bridge token minted for it), then
+/// `rest` (`&called=…`).
+pub fn bridge_url(
+    hub: &VoipHub,
+    addr: impl std::fmt::Display,
+    call_id: &str,
+    rest: &str,
+) -> String {
+    format!(
+        "ws://{addr}/voip/bridge?token={}&call_id={call_id}{rest}",
+        hub.mint_bridge_token(call_id)
+            .expect("a media token is configured")
+    )
+}
+
+/// The media stream, opened with the media token as a bearer header.
+pub async fn connect_stream(
+    addr: impl std::fmt::Display,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let mut request = format!("ws://{addr}/voip/stream")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
+}
 
 /// A sine tone.
 pub fn tone(hz: f64, ms: u32, rate: u32, amplitude: f64) -> Vec<i16> {

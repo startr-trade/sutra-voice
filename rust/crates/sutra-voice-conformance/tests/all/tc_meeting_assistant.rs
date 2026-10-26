@@ -223,6 +223,8 @@ fn boot() -> Meeting {
             format!("ws://{engine_name}:8080"),
         )
         .env("SUTRA_VOIP_TRUNK", "conference")
+        .env("SUTRA_VOIP_ORIGINATE_ALLOW", "+1555*")
+        .env("SUTRA_VOIP_ORIGINATE_HOME_PREFIX", "+1")
         .env("SUTRA_VOIP_PROMPTS_DIR", "/prompts")
         .env(
             "SUTRA_VOIP_RECORDING_STORE",
@@ -573,8 +575,12 @@ async fn tc_meeting_assistant_joins_records_transcribes_and_reports() {
         "the PIN never reaches the audit trail"
     );
     let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
-    let (_, wav) = sutra_objectstore::sealed::open(&kek, key, &stored).expect("opens with the KEK");
-    assert_eq!(&wav[..4], b"RIFF");
+    // A streamed recording: sealed chunk by chunk, verified to its final frame.
+    let opened = sutra_transport_voip::recording::open_stream(&kek, key, &stored)
+        .expect("opens with the KEK");
+    assert!(opened.complete, "the recording verifies to its final frame");
+    assert_eq!(recording["complete"], true);
+    assert_eq!(&opened.plaintext[..4], b"RIFF");
     let duration = recording["durationMs"].as_u64().unwrap();
     assert!(
         (18_000..=40_000).contains(&duration),

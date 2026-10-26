@@ -10,7 +10,8 @@
 //! | `SUTRA_VOIP_RWI_CA_FILE` | extra trusted CA certificates (PEM) for a `wss://` control URL | none: the platform's roots |
 //! | `SUTRA_VOIP_RWI_TOKEN` | the control bearer token — a reference (`env:…`, `secret:…`) | required for `rustpbx` |
 //! | `SUTRA_VOIP_PUBLIC_MEDIA_URL` | how the gateway reaches this engine (`ws://engine:8080`) | `ws://localhost:8080` |
-//! | `SUTRA_VOIP_MEDIA_TOKEN` | the token every media / webhook request must carry as `?token=` — a reference | none: those routes refuse every request |
+//! | `SUTRA_VOIP_MEDIA_TOKEN` | the deployment's media credential — a reference. A media-stream client sends it as `Authorization: Bearer`; the PBX's webhook / IVR-step URLs carry it (or the header); the PCM bridge never sees it — each bridge URL carries a short-lived token minted for its one call | none: those routes refuse every request |
+//! | `SUTRA_VOIP_BRIDGE_TOKEN_TTL_SECONDS` | how long a minted bridge token is valid (each opens one bridge socket) | `60` |
 //! | `SUTRA_VOIP_BRIDGE_RATE` | the PCM bridge sample rate requested from the gateway | `8000` |
 //! | `SUTRA_VOIP_TRUNK` | the default trunk for originate | none |
 //! | `SUTRA_VOIP_PROMPTS_DIR` | the directory recorded prompts are played from (`play` with `prompt`) | none: a `prompt` play is refused |
@@ -23,6 +24,14 @@
 //! | `SUTRA_VOIP_RECORDING_KEY_ID` | the key id sealed recordings name | `recordings` |
 //! | `SUTRA_VOIP_RECORDING_ENCRYPTION` | `envelope` (sealed, the default) or `none` (the store encrypts) | `envelope` |
 //! | `SUTRA_VOIP_RECORDING_MAX_SECONDS` | the longest recording kept (audio beyond it is not recorded) | `7200` |
+//! | `SUTRA_VOIP_RECORDING_SPOOL_DIR` | where each recording's part in progress is spooled (sealed) until it is uploaded, so a crash loses at most a chunk; `none` holds parts in memory | `<temp dir>/sutra-voip-spool` |
+//! | `SUTRA_VOIP_RECORDING_SWEEP_SECONDS` | how often interrupted recordings are looked for (and at start-up); `0`: at start-up only | `600` |
+//! | `SUTRA_VOIP_INSTANCE_ID` | who writes a recording (stable across restarts); distinct per process sharing a host | `HOSTNAME` |
+//! | `SUTRA_VOIP_ORIGINATE_ALLOW` | the destinations `originate` may dial: glob patterns (`+1555*`, `sip:*@pbx.internal`, `*`), comma-separated | none: **every originate is refused** |
+//! | `SUTRA_VOIP_ORIGINATE_HOME_PREFIX` | the home numbering plan (`+1`): `+` numbers outside it are international | none: every `+` number is international |
+//! | `SUTRA_VOIP_ORIGINATE_ALLOW_INTERNATIONAL` / `_ALLOW_PREMIUM` | dial international / premium-rate numbers without naming them specifically | `false` |
+//! | `SUTRA_VOIP_ORIGINATE_BLOCK_PREFIXES` | the premium-rate prefixes refused | a built-in list ([`crate::policy::DEFAULT_BLOCKED_PREFIXES`]) |
+//! | `SUTRA_VOIP_ORIGINATE_RATE_PER_DESTINATION` / `_RATE_GLOBAL` | originates per destination per hour / in total per minute (`0`: unlimited) | `10` / `60` |
 //!
 //! Per channel (inbound, `transport: voip`): the event kind comes from `event:` (or a `bind:`
 //! naming the kind); a `bind: number:…` channel is a `call-start` channel. Turn settings sit
@@ -82,6 +91,16 @@ pub const ENV_RECORDING_KEK: &str = "SUTRA_VOIP_RECORDING_KEK";
 pub const ENV_RECORDING_KEY_ID: &str = "SUTRA_VOIP_RECORDING_KEY_ID";
 pub const ENV_RECORDING_ENCRYPTION: &str = "SUTRA_VOIP_RECORDING_ENCRYPTION";
 pub const ENV_RECORDING_MAX_SECONDS: &str = "SUTRA_VOIP_RECORDING_MAX_SECONDS";
+pub const ENV_RECORDING_SPOOL_DIR: &str = "SUTRA_VOIP_RECORDING_SPOOL_DIR";
+pub const ENV_RECORDING_SWEEP_SECONDS: &str = "SUTRA_VOIP_RECORDING_SWEEP_SECONDS";
+pub const ENV_BRIDGE_TOKEN_TTL_SECONDS: &str = "SUTRA_VOIP_BRIDGE_TOKEN_TTL_SECONDS";
+pub const ENV_ORIGINATE_ALLOW: &str = "SUTRA_VOIP_ORIGINATE_ALLOW";
+pub const ENV_ORIGINATE_HOME_PREFIX: &str = "SUTRA_VOIP_ORIGINATE_HOME_PREFIX";
+pub const ENV_ORIGINATE_ALLOW_INTERNATIONAL: &str = "SUTRA_VOIP_ORIGINATE_ALLOW_INTERNATIONAL";
+pub const ENV_ORIGINATE_ALLOW_PREMIUM: &str = "SUTRA_VOIP_ORIGINATE_ALLOW_PREMIUM";
+pub const ENV_ORIGINATE_BLOCK_PREFIXES: &str = "SUTRA_VOIP_ORIGINATE_BLOCK_PREFIXES";
+pub const ENV_ORIGINATE_RATE_PER_DESTINATION: &str = "SUTRA_VOIP_ORIGINATE_RATE_PER_DESTINATION";
+pub const ENV_ORIGINATE_RATE_GLOBAL: &str = "SUTRA_VOIP_ORIGINATE_RATE_GLOBAL";
 
 /// How long a transcription session may run on after the hang-up, by default.
 pub const DEFAULT_TRANSCRIBE_DRAIN_MS: u64 = 3000;
@@ -111,6 +130,10 @@ pub struct RecordingSettings {
     pub kek_secret: Option<String>,
     pub key_id: String,
     pub max_seconds: u64,
+    /// Where parts in progress are spooled; `None` holds them in memory.
+    pub spool_dir: Option<std::path::PathBuf>,
+    /// How often interrupted recordings are swept (0: at start-up only).
+    pub sweep_seconds: u64,
 }
 
 impl std::fmt::Debug for RecordingSettings {
@@ -124,6 +147,8 @@ impl std::fmt::Debug for RecordingSettings {
             .field("sealed", &self.kek_secret.is_some())
             .field("key_id", &self.key_id)
             .field("max_seconds", &self.max_seconds)
+            .field("spool_dir", &self.spool_dir)
+            .field("sweep_seconds", &self.sweep_seconds)
             .finish()
     }
 }
@@ -142,6 +167,8 @@ impl RecordingSettings {
             kek_secret: kek_secret.map(str::to_string),
             key_id: "recordings".to_string(),
             max_seconds: DEFAULT_RECORDING_MAX_SECONDS,
+            spool_dir: None,
+            sweep_seconds: crate::recording::DEFAULT_SWEEP_SECONDS,
         }
     }
 
@@ -201,7 +228,22 @@ impl RecordingSettings {
                 )))
             }
         };
+        let spool_dir = match get(ENV_RECORDING_SPOOL_DIR) {
+            Some(v) if v.eq_ignore_ascii_case("none") => None,
+            Some(v) => Some(std::path::PathBuf::from(v)),
+            None => Some(std::env::temp_dir().join("sutra-voip-spool")),
+        };
+        let sweep_seconds = match get(ENV_RECORDING_SWEEP_SECONDS) {
+            None => crate::recording::DEFAULT_SWEEP_SECONDS,
+            Some(raw) => raw.parse::<u64>().map_err(|_| {
+                invalid(format!(
+                    "{ENV_RECORDING_SWEEP_SECONDS}: '{raw}' is not a number"
+                ))
+            })?,
+        };
         Ok(Some(RecordingSettings {
+            spool_dir,
+            sweep_seconds,
             store,
             endpoint: get(ENV_RECORDING_ENDPOINT),
             region: get(ENV_RECORDING_REGION).unwrap_or_else(|| "us-east-1".to_string()),
@@ -232,6 +274,10 @@ pub struct VoipConfig {
     pub prompts_dir: Option<std::path::PathBuf>,
     /// Where recordings go; `None` refuses a call asked to be recorded.
     pub recording: Option<RecordingSettings>,
+    /// How long a minted bridge token is valid.
+    pub bridge_token_ttl_seconds: u64,
+    /// The toll-fraud controls on `originate`.
+    pub originate: crate::policy::OriginatePolicy,
 }
 
 impl VoipConfig {
@@ -246,6 +292,8 @@ impl VoipConfig {
             bridge_connect_timeout_ms: 10_000,
             prompts_dir: None,
             recording: None,
+            bridge_token_ttl_seconds: crate::tokens::DEFAULT_TOKEN_TTL_SECONDS,
+            originate: crate::policy::OriginatePolicy::default(),
         }
     }
 
@@ -333,7 +381,19 @@ impl VoipConfig {
             }
         }
         let recording = RecordingSettings::from_lookup(&get, &resolve)?;
+        let originate = originate_policy_of(&get)?;
+        let bridge_token_ttl_seconds = match get(ENV_BRIDGE_TOKEN_TTL_SECONDS) {
+            None => crate::tokens::DEFAULT_TOKEN_TTL_SECONDS,
+            Some(raw) => raw.parse::<u64>().ok().filter(|v| *v > 0).ok_or_else(|| {
+                Diagnostic::error(
+                    codes::CONFIG_INVALID,
+                    format!("{ENV_BRIDGE_TOKEN_TTL_SECONDS}: '{raw}' is not a positive number"),
+                )
+            })?,
+        };
         Ok(VoipConfig {
+            bridge_token_ttl_seconds,
+            originate,
             gateway,
             public_media_url: get(ENV_PUBLIC_MEDIA_URL)
                 .unwrap_or_else(|| DEFAULT_PUBLIC_MEDIA_URL.to_string())
@@ -347,6 +407,64 @@ impl VoipConfig {
             recording,
         })
     }
+}
+
+/// The toll-fraud controls from the environment (see [`crate::policy`]).
+fn originate_policy_of(
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<crate::policy::OriginatePolicy, Diagnostic> {
+    let invalid = |message: String| Diagnostic::error(codes::CONFIG_INVALID, message);
+    let list = |raw: String| -> Vec<String> {
+        raw.split([',', ' ', '\n', '\t'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let flag = |key: &str| -> Result<bool, Diagnostic> {
+        match get(key).as_deref() {
+            None => Ok(false),
+            Some(v) if v.eq_ignore_ascii_case("true") => Ok(true),
+            Some(v) if v.eq_ignore_ascii_case("false") => Ok(false),
+            Some(other) => Err(invalid(format!("{key}: '{other}' is not true or false"))),
+        }
+    };
+    let count = |key: &str, default: u32| -> Result<u32, Diagnostic> {
+        match get(key) {
+            None => Ok(default),
+            Some(raw) => raw
+                .parse::<u32>()
+                .map_err(|_| invalid(format!("{key}: '{raw}' is not a number"))),
+        }
+    };
+    let mut policy = crate::policy::OriginatePolicy {
+        allow: get(ENV_ORIGINATE_ALLOW).map(list).unwrap_or_default(),
+        allow_international: flag(ENV_ORIGINATE_ALLOW_INTERNATIONAL)?,
+        allow_premium: flag(ENV_ORIGINATE_ALLOW_PREMIUM)?,
+        home_prefix: get(ENV_ORIGINATE_HOME_PREFIX),
+        per_destination_per_hour: count(
+            ENV_ORIGINATE_RATE_PER_DESTINATION,
+            crate::policy::DEFAULT_RATE_PER_DESTINATION_PER_HOUR,
+        )?,
+        global_per_minute: count(
+            ENV_ORIGINATE_RATE_GLOBAL,
+            crate::policy::DEFAULT_RATE_GLOBAL_PER_MINUTE,
+        )?,
+        ..crate::policy::OriginatePolicy::default()
+    };
+    if let Some(raw) = get(ENV_ORIGINATE_BLOCK_PREFIXES) {
+        policy.blocked_prefixes = list(raw);
+    }
+    if let Some(home) = &policy.home_prefix {
+        if !home.starts_with('+')
+            || home.len() < 2
+            || !home[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(invalid(format!(
+                "{ENV_ORIGINATE_HOME_PREFIX}: '{home}' is not a + and a country code"
+            )));
+        }
+    }
+    Ok(policy)
 }
 
 /// The inbound message kinds this transport delivers.

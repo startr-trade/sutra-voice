@@ -120,7 +120,7 @@ async fn rig_with(channels: &str) -> Rig {
     let mut stub = stub().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut config = VoipConfig::generic(&format!("ws://{addr}"), Some(MEDIA_TOKEN));
+    let mut config = test_config(&format!("ws://{addr}"), Some(MEDIA_TOKEN));
     let mut settings = RwiSettings::new(stub.url.clone(), RWI_TOKEN);
     settings.command_timeout = Duration::from_secs(3);
     settings.reconnect_min = Duration::from_millis(50);
@@ -194,10 +194,13 @@ async fn inbound_webhook_call_created_attaches_then_bridge_and_hangup() {
     let action: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(action["type"], "voip_bridge");
     let uri = action["create_room_uri"].as_str().unwrap().to_string();
+    // A bridge token minted for this call — never the media token.
     assert!(
-        uri.starts_with(&format!(
-            "ws://{addr}/voip/bridge?token={MEDIA_TOKEN}&call_id=in-1"
-        )),
+        uri.starts_with(&format!("ws://{addr}/voip/bridge?token=v1.")),
+        "{uri}"
+    );
+    assert!(
+        uri.contains("&call_id=in-1") && !uri.contains(MEDIA_TOKEN),
         "{uri}"
     );
     assert!(uri.contains("samplerate=8000") && uri.contains("codec=pcm"));
@@ -291,11 +294,12 @@ async fn originate_answered_transfers_to_the_bridge_and_hangup_always_goes_over_
 
     let transfer = next_command(&mut rig.stub, wire::CMD_TRANSFER).await;
     let target = transfer["params"]["target"].as_str().unwrap().to_string();
-    let prefix = format!(
-        "voip_bridge:ws://{}/voip/bridge?token={MEDIA_TOKEN}&call_id={call_id}",
-        rig.addr
-    );
+    let prefix = format!("voip_bridge:ws://{}/voip/bridge?token=v1.", rig.addr);
     assert!(target.starts_with(&prefix), "{target}");
+    assert!(
+        target.contains(&format!("&call_id={call_id}")) && !target.contains(MEDIA_TOKEN),
+        "{target}"
+    );
 
     // The PBX dials the bridge: a `connected` progress, no call-start for an originated call.
     let (_ws, _) = tokio_tungstenite::connect_async(target.trim_start_matches("voip_bridge:"))

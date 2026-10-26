@@ -46,9 +46,20 @@ services:
       SUTRA_VOIP_MEDIA_TOKEN: env:VOIP_MEDIA_TOKEN
       SUTRA_VOIP_PUBLIC_MEDIA_URL: ws://engine:8080      # how the PBX reaches this engine
       SUTRA_VOIP_TRUNK: carrier                          # the PBX trunk originated calls use
+      # TOLL-FRAUD CONTROLS: originate dials nothing until this lists what it may. The reminders
+      # call the example's fictional +1 555 numbers only.
+      SUTRA_VOIP_ORIGINATE_ALLOW: "+1555*"
+      SUTRA_VOIP_ORIGINATE_HOME_PREFIX: "+1"
       # Must match rustpbx/config.toml. Dev-only values: replace both outside a local run.
       PBX_RWI_TOKEN: ${PBX_RWI_TOKEN:-dev-only-rwi-token}
       VOIP_MEDIA_TOKEN: ${VOIP_MEDIA_TOKEN:-dev-only-media-token}
+
+      # THE RECORDINGS: the inbound channel records each call once the greeting (which announces
+      # it) has played to the end (`record: after-consent`). Kept in memory here, sealed under a
+      # dev-only key; a deployment points this at an S3-compatible bucket.
+      SUTRA_VOIP_RECORDING_STORE: memory://voice-recordings/calls
+      SUTRA_VOIP_RECORDING_KEK: env:RECORDINGS_KEK
+      RECORDINGS_KEK: ${RECORDINGS_KEK:-dev-only-recordings-kek-change-me}
 
       # What channels.yaml and datastores.yaml name by reference.
       VOICE_API_KEY: ${VOICE_API_KEY:-dev-only-voice-key}

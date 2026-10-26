@@ -24,6 +24,8 @@ sutra-formats = { workspace = true }
 # with the key it was sealed under.
 sutra-objectstore = { workspace = true }
 sutra-crypto = { workspace = true }
+# ... with the streamed-recording reader (the sealed-stream format).
+sutra-transport-voip = { path = "../sutra-transport-voip" }
 # Per-suite ad-hoc containers (rustpbx, SIPp, LiveKit, MinIO, the stub model).
 testcontainers = { workspace = true }
 serde_json = { workspace = true }

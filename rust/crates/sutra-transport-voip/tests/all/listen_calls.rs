@@ -13,13 +13,14 @@ use sutra_llm_spi::{
     AudioSession, AudioSessionConfig, AudioSessionEvent, BoxFuture, Diagnostic, LlmFailure,
     LlmProvider, LlmProviderConfig, LlmProviderFactory, LlmRequest, LlmResponse,
 };
-use sutra_objectstore::{sealed, MemoryObjectStore, ObjectStore, StoreLocation};
 use sutra_transport_voip::audio::{pcm16_to_le, wav_unwrap, wav_wrap};
 use sutra_transport_voip::config::{route_set_of, RecordingSettings, VoipConfig};
 use sutra_transport_voip::gateway::{GatewayControl, GatewayError, GatewayEvent, OriginateRequest};
 use sutra_transport_voip::hub::{OpError, VoipHub};
 use sutra_transport_voip::listen::Recorder;
 use sutra_transport_voip::media::media_router;
+use sutra_transport_voip::recording::{open_stream, SEALED_STREAM_CONTENT_TYPE};
+use sutra_transport_voip::store::{MemoryRecordingStore, RecordingStore, StoreLocation};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -226,7 +227,7 @@ struct Rig {
     addr: std::net::SocketAddr,
     rx: mpsc::UnboundedReceiver<sutra_channels::InboundMessage>,
     gateway: Arc<ScriptedGateway>,
-    store: MemoryObjectStore,
+    store: MemoryRecordingStore,
 }
 
 async fn rig(with_recorder: bool) -> Rig {
@@ -235,17 +236,18 @@ async fn rig(with_recorder: bool) -> Rig {
     publish_llm_channels(&defs);
     let routes = route_set_of(&defs).unwrap();
     let gateway = Arc::new(ScriptedGateway::default());
-    let store = MemoryObjectStore::new(StoreLocation::parse("memory://recordings/calls").unwrap());
+    let store =
+        MemoryRecordingStore::new(StoreLocation::parse("memory://recordings/calls").unwrap());
     let recorder = with_recorder.then(|| {
         Arc::new(Recorder::new(
-            Arc::new(store.clone()) as Arc<dyn ObjectStore>,
+            Arc::new(store.clone()) as Arc<dyn RecordingStore>,
             Some(KEK),
             "rec-key",
             60,
         ))
     });
     let hub = VoipHub::with_recorder(
-        VoipConfig::generic("ws://unused", Some(TOKEN)),
+        test_config("ws://unused", Some(TOKEN)),
         intake,
         routes,
         Arc::clone(&gateway) as Arc<dyn GatewayControl>,
@@ -293,10 +295,7 @@ async fn a_listen_only_call_is_recorded_sealed_transcribed_and_reported_at_the_h
     rig.hub.on_gateway_event(GatewayEvent::Answered {
         call_id: "meet-1".into(),
     });
-    let url = format!(
-        "ws://{}/voip/bridge?token={TOKEN}&call_id=meet-1&samplerate=8000&codec=pcm",
-        rig.addr
-    );
+    let url = bridge_url(&rig.hub, rig.addr, "meet-1", "&samplerate=8000&codec=pcm");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let connected = next_on(&mut rig.rx, "progress").await;
     assert_eq!(json_of(&connected)["status"], "answered");
@@ -409,11 +408,14 @@ async fn a_listen_only_call_is_recorded_sealed_transcribed_and_reported_at_the_h
     assert_eq!(recording["sha256"], sutra_objectstore::sha256_hex(&stored));
     assert_eq!(
         rig.store.content_type(&format!("calls/{key}")).as_deref(),
-        Some(sealed::SEALED_CONTENT_TYPE)
+        Some(SEALED_STREAM_CONTENT_TYPE)
     );
     let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
-    let (header, wav) = sealed::open(&kek, &format!("calls/{key}"), &stored).unwrap();
-    assert_eq!(header.content_type, "audio/wav");
+    let opened = open_stream(&kek, &format!("calls/{key}"), &stored).unwrap();
+    assert_eq!(opened.header.content_type, "audio/wav");
+    assert!(opened.complete, "the final frame verifies");
+    assert_eq!(recording["complete"], true);
+    let wav = opened.plaintext;
     let (samples, rate) = wav_unwrap(&wav).unwrap();
     assert_eq!(rate, 8000);
     // The consent prompt is mixed in at the start of the recording.
@@ -472,10 +474,7 @@ async fn dtmf_digits_are_checked() {
     rig.hub.on_gateway_event(GatewayEvent::Answered {
         call_id: "meet-1".into(),
     });
-    let url = format!(
-        "ws://{}/voip/bridge?token={TOKEN}&call_id=meet-1&samplerate=8000&codec=pcm",
-        rig.addr
-    );
+    let url = bridge_url(&rig.hub, rig.addr, "meet-1", "&samplerate=8000&codec=pcm");
     let (_ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let _ = next_on(&mut rig.rx, "progress").await;
     let bad = outbound(

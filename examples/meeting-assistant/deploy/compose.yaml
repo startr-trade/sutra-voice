@@ -45,6 +45,10 @@ services:
       SUTRA_VOIP_MEDIA_TOKEN: env:VOIP_MEDIA_TOKEN
       SUTRA_VOIP_PUBLIC_MEDIA_URL: ws://engine:8080      # how the PBX reaches this engine
       SUTRA_VOIP_TRUNK: conference                       # the PBX trunk the bot dials out on
+      # TOLL-FRAUD CONTROLS: originate dials nothing until this lists what it may — here, the
+      # example's (fictional) conference dial-in numbers.
+      SUTRA_VOIP_ORIGINATE_ALLOW: "+1555*"
+      SUTRA_VOIP_ORIGINATE_HOME_PREFIX: "+1"
       SUTRA_VOIP_PROMPTS_DIR: /prompts                   # the consent announcement
       PBX_RWI_TOKEN: ${PBX_RWI_TOKEN:-dev-only-rwi-token}
       VOIP_MEDIA_TOKEN: ${VOIP_MEDIA_TOKEN:-dev-only-media-token}

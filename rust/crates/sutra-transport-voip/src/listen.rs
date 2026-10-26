@@ -2,12 +2,11 @@
 //!
 //! The far end's audio is forked to two consumers, and neither goes through the flow:
 //!
-//! - **the recorder** — the call's audio kept in memory while the call is up (the far end, with
-//!   the transport's own prompts mixed in where they were played), written once at the
-//!   hang-up as a WAV file to the deployment's object store, sealed with envelope encryption
-//!   ([`sutra_objectstore::sealed`]). The flow receives a media REFERENCE on the `call-hangup`
-//!   message (`recording`: uri, SHA-256 of the stored object, duration, format, whether the
-//!   consent announcement was played) — never the media.
+//! - **the recorder** — the call's audio (the far end, with the transport's own prompts mixed in
+//!   where they were played) streamed to the deployment's object store while the call is up,
+//!   sealed chunk by chunk ([`crate::recording`]). The flow receives a media REFERENCE on the
+//!   `call-hangup` message (`recording`: uri, SHA-256 of the stored object, duration, format,
+//!   whether it is complete, whether the consent announcement was played) — never the media.
 //! - **the transcriber** — a live audio session ([`sutra_llm_spi::AudioSession`]) opened
 //!   transcription-only through the `llm` channel `transcribe.channel` names (its first
 //!   candidate with live sessions, with the channel's fallback); each final transcript
@@ -27,155 +26,50 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use sutra_llm_spi::{AudioSessionConfig, AudioSessionEvent, TurnDetection};
-use sutra_objectstore::{sealed, ObjectStore, ObjectStoreError, StoredObject};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::audio::{self, AudioFormat};
-use crate::config::{EventKind, RecordingSettings, TranscribeSettings};
+use crate::config::{EventKind, TranscribeSettings};
 use crate::features::{analyze_turn, PitchConfig};
 use crate::hub::{Call, VoipHub};
+use crate::recording::{FinishedRecording, RecordingWriter};
+pub use crate::recording::{Recorder, RECORDING_FORMAT};
 
-/// The media type recordings are written in.
-pub const RECORDING_FORMAT: &str = "audio/wav";
 /// The `kind` a media reference carries (what `<q:audit capture="media">` collects).
 pub const MEDIA_REFERENCE_KIND: &str = "media";
 /// What `speaker` says when the provider labels none.
 pub const UNKNOWN_SPEAKER: &str = "unknown";
-
-/// The recordings sink: the object store plus the sealing key.
-pub struct Recorder {
-    pub store: Arc<dyn ObjectStore>,
-    kek: Option<sutra_crypto::Kek>,
-    key_id: String,
-    pub max_seconds: u64,
-}
-
-impl Recorder {
-    /// Build the sink `settings` describe.
-    pub fn from_settings(settings: &RecordingSettings) -> Result<Recorder, ObjectStoreError> {
-        let store: Arc<dyn ObjectStore> = match settings.store.scheme.as_str() {
-            "memory" => Arc::new(sutra_objectstore::MemoryObjectStore::new(
-                settings.store.clone(),
-            )),
-            _ => {
-                let credentials = sutra_objectstore::sigv4::Credentials {
-                    access_key: settings.access_key.clone().unwrap_or_default(),
-                    secret_key: settings.secret_key.clone().unwrap_or_default(),
-                    session_token: None,
-                };
-                let mut config = sutra_objectstore::S3Config::new(
-                    settings.store.clone(),
-                    &settings.region,
-                    credentials,
-                );
-                config.endpoint = settings.endpoint.clone();
-                Arc::new(sutra_objectstore::S3ObjectStore::new(config)?)
-            }
-        };
-        Ok(Recorder::new(
-            store,
-            settings.kek_secret.as_deref(),
-            &settings.key_id,
-            settings.max_seconds,
-        ))
-    }
-
-    pub fn new(
-        store: Arc<dyn ObjectStore>,
-        kek_secret: Option<&str>,
-        key_id: &str,
-        max_seconds: u64,
-    ) -> Recorder {
-        Recorder {
-            store,
-            kek: kek_secret.map(|s| sutra_crypto::Kek::from_secret(s.as_bytes())),
-            key_id: key_id.to_string(),
-            max_seconds,
-        }
-    }
-
-    pub fn sealed(&self) -> bool {
-        self.kek.is_some()
-    }
-
-    /// Write `wav` for `call_id` of `module_key`; retried on an unavailable store.
-    async fn write(
-        &self,
-        module_key: &str,
-        call_id: &str,
-        wav: Vec<u8>,
-    ) -> Result<(StoredObject, Option<String>), String> {
-        self.write_at(module_key, &[call_id], wav).await
-    }
-
-    /// Write `wav` at `<module path>/<segments…>.wav` (each segment made safe); retried on an
-    /// unavailable store.
-    pub(crate) async fn write_at(
-        &self,
-        module_key: &str,
-        segments: &[&str],
-        wav: Vec<u8>,
-    ) -> Result<(StoredObject, Option<String>), String> {
-        let safe = |s: &str| -> String {
-            s.chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect()
-        };
-        let module_path: Vec<String> = module_key.split('/').map(safe).collect();
-        let name: Vec<String> = segments.iter().map(|s| safe(s)).collect();
-        let base = format!("{}/{}.wav", module_path.join("/"), name.join("/"));
-        let (key, body, content_type) = match &self.kek {
-            Some(kek) => {
-                let key = format!("{base}{}", sealed::SEALED_EXTENSION);
-                let full = self.store.full_key(&key);
-                let body = sealed::seal(kek, &self.key_id, &full, RECORDING_FORMAT, &wav)?;
-                (key, body, sealed::SEALED_CONTENT_TYPE)
-            }
-            None => (base, wav, RECORDING_FORMAT),
-        };
-        let mut delay = Duration::from_millis(500);
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.store.put(&key, body.clone(), content_type).await {
-                Ok(stored) => return Ok((stored, self.kek.as_ref().map(|_| self.key_id.clone()))),
-                Err(ObjectStoreError::Unavailable(m)) if attempt < 4 => {
-                    tracing::warn!(
-                        key = %key,
-                        attempt,
-                        "voip: recording write failed, retrying: {m}"
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-    }
-}
+/// How much of a listen-only call's audio is kept in memory for transcript-segment features.
+pub const TAP_WINDOW_SECONDS: u64 = 120;
 
 /// A listen-only call's media-plane state (inside the call, behind a lock).
 pub struct ListenState {
-    /// The far end's audio since the media connected, at `rate`.
+    /// The far end's most recent audio, at `rate`: samples `[tap_base, tap_base + tap.len())`
+    /// of the call (counted from when the media connected).
     pub tap: Vec<i16>,
+    pub tap_base: u64,
+    /// The most samples the tap keeps.
+    pub window_samples: usize,
     pub rate: u32,
-    /// Whether the audio is recorded (the request was marked `capture=media`).
+    /// Whether the audio is to be recorded (the request was marked `capture=media`, the
+    /// channel says `record:`, or the flow asked with `record-start`).
     pub record: bool,
-    /// The most samples kept.
-    pub max_samples: usize,
-    /// Played audio: (offset into the tap, samples), mixed into the recording at the end.
-    pub played: Vec<(usize, Vec<i16>)>,
+    /// The recording waits for consent (`record: after-consent`).
+    pub record_after_consent: bool,
+    /// The recording in progress, and where in the call it started (samples).
+    pub recording: Option<RecordingWriter>,
+    pub recording_origin: u64,
+    /// Recordings already finished (a `record-stop`), as media references.
+    pub finished: Vec<Value>,
+    /// Why a recording could not start, when it could not.
+    pub recording_error: Option<String>,
+    /// The longest recording kept.
+    pub max_seconds: u64,
     /// Frames to the transcriber (`None` when the call is not transcribed).
     pub frames: Option<mpsc::UnboundedSender<Vec<i16>>>,
     /// The transcriber's result, once it has finished.
     pub transcript: Option<oneshot::Receiver<Value>>,
-    /// Whether the consent announcement was played to the end, and where.
+    /// Whether the consent announcement was played to the end, and where (call time).
     pub consent_at_ms: Option<u64>,
     /// Whether audio beyond the limit was dropped.
     pub truncated: bool,
@@ -191,15 +85,54 @@ impl ListenState {
     pub fn new(rate: u32, record: bool, max_seconds: u64) -> ListenState {
         ListenState {
             tap: Vec::new(),
+            tap_base: 0,
+            window_samples: (max_seconds.saturating_mul(u64::from(rate))) as usize,
             rate,
             record,
-            max_samples: (max_seconds.saturating_mul(u64::from(rate))) as usize,
-            played: Vec::new(),
+            record_after_consent: false,
+            recording: None,
+            recording_origin: 0,
+            finished: Vec::new(),
+            recording_error: None,
+            max_seconds,
             frames: None,
             transcript: None,
             consent_at_ms: None,
             truncated: false,
             started: std::time::Instant::now(),
+        }
+    }
+
+    /// Keep only the last `seconds` of audio in memory.
+    pub fn with_window(mut self, seconds: u64) -> ListenState {
+        self.window_samples = (seconds.saturating_mul(u64::from(self.rate))) as usize;
+        self
+    }
+
+    /// Samples since the media connected.
+    pub fn position(&self) -> u64 {
+        self.tap_base + self.tap.len() as u64
+    }
+
+    /// The recording's position for call position `at`, when it was recording then.
+    pub fn recording_position(&self, at: u64) -> Option<u64> {
+        self.recording
+            .as_ref()
+            .and_then(|_| at.checked_sub(self.recording_origin))
+    }
+
+    fn keep(&mut self, samples: &[i16]) {
+        self.tap.extend_from_slice(samples);
+        if self.tap.len() > self.window_samples {
+            let drop = self.tap.len() - self.window_samples;
+            self.tap.drain(..drop);
+            self.tap_base += drop as u64;
+        }
+        if let Some(writer) = self.recording.as_mut() {
+            writer.push(samples);
+            if writer.truncated {
+                self.truncated = true;
+            }
         }
     }
 
@@ -209,16 +142,12 @@ impl ListenState {
     pub fn catch_up(&mut self) {
         let rate = u64::from(self.rate.max(1));
         let due = self.started.elapsed().as_millis() as u64 * rate / 1000;
-        let have = self.tap.len() as u64;
+        let have = self.position();
         if have + TAP_SLACK_MS * rate / 1000 >= due {
             return;
         }
         let gap = (due - have) as usize;
-        let room = self.max_samples.saturating_sub(self.tap.len());
-        if gap > room {
-            self.truncated = true;
-        }
-        self.tap.resize(self.tap.len() + gap.min(room), 0);
+        self.keep(&vec![0; gap]);
         if let Some(frames) = &self.frames {
             let frame = (rate / 50) as usize;
             for _ in 0..gap / frame.max(1) {
@@ -230,11 +159,7 @@ impl ListenState {
     /// Keep one frame of the far end's audio and hand it to the transcriber.
     pub fn on_audio(&mut self, samples: &[i16]) {
         self.catch_up();
-        if self.tap.len() + samples.len() <= self.max_samples {
-            self.tap.extend_from_slice(samples);
-        } else {
-            self.truncated = true;
-        }
+        self.keep(samples);
         if let Some(frames) = &self.frames {
             let _ = frames.send(samples.to_vec());
         }
@@ -242,61 +167,136 @@ impl ListenState {
 
     /// Milliseconds of audio so far.
     pub fn elapsed_ms(&self) -> u64 {
-        self.tap.len() as u64 * 1000 / u64::from(self.rate.max(1))
+        self.position() * 1000 / u64::from(self.rate.max(1))
     }
 
-    /// The recording: the far end's audio with the played audio mixed in where it played.
-    pub fn mixed(&self) -> Vec<i16> {
-        let mut out = self.tap.clone();
-        for (offset, samples) in &self.played {
-            let end = offset + samples.len();
-            if out.len() < end {
-                out.resize(end.min(self.max_samples.max(out.len())), 0);
+    /// The far end's audio in `[from, to)` (call samples), as far as the tap still holds it.
+    pub fn tap_between(&self, from: u64, to: u64) -> &[i16] {
+        let from = from
+            .saturating_sub(self.tap_base)
+            .min(self.tap.len() as u64) as usize;
+        let to = to.saturating_sub(self.tap_base).min(self.tap.len() as u64) as usize;
+        &self.tap[from..to.max(from)]
+    }
+
+    /// Start recording now (`segments` name the object), unless a recording is in progress.
+    pub fn start_recording(
+        &mut self,
+        recorder: &Arc<Recorder>,
+        module_key: &str,
+        segments: &[&str],
+        owner: crate::recording::RecordingOwner,
+    ) -> Result<(), String> {
+        if self.recording.is_some() {
+            return Ok(());
+        }
+        self.catch_up();
+        match recorder.begin(module_key, segments, self.rate, owner) {
+            Ok(writer) => {
+                self.recording = Some(writer);
+                self.recording_origin = self.position();
+                self.record = true;
+                self.recording_error = None;
+                Ok(())
             }
-            for (slot, sample) in out.iter_mut().skip(*offset).zip(samples) {
-                *slot = slot.saturating_add(*sample);
+            Err(e) => {
+                self.recording_error = Some(e.clone());
+                Err(e)
             }
         }
-        out
+    }
+
+    /// The recording's media reference template (what the finished object adds to).
+    fn reference_of(&self, writer: &RecordingWriter, call_id: &str) -> Value {
+        json!({
+            "kind": MEDIA_REFERENCE_KIND,
+            "uri": writer.uri,
+            "durationMs": writer.duration_ms(),
+            "format": RECORDING_FORMAT,
+            "rate": writer.rate(),
+            "channels": 1,
+            "encryption": writer.key_id.as_ref().map(|id| json!({
+                "scheme": crate::recording::SEALED_STREAM_SCHEME,
+                "cipher": crate::recording::CIPHER,
+                "keyId": id,
+            })),
+            "consentAnnounced": self.consent_at_ms.is_some(),
+            // Relative to the recording's own start (negative: announced before it began).
+            "consentAnnouncedAtMs": self.consent_at_ms.map(|at| {
+                at as i64 - (self.recording_origin * 1000 / u64::from(self.rate.max(1))) as i64
+            }),
+            "startMs": self.recording_origin * 1000 / u64::from(self.rate.max(1)),
+            "truncated": writer.truncated,
+            "callId": call_id,
+        })
+    }
+
+    /// End the recording in progress: answers its reference template and the receiver of the
+    /// stored outcome (await it outside the lock, then [`complete_reference`]).
+    pub fn stop_recording(&mut self, call_id: &str) -> Option<PendingRecording> {
+        self.catch_up();
+        let writer = self.recording.take()?;
+        let reference = self.reference_of(&writer, call_id);
+        Some(PendingRecording {
+            reference,
+            done: writer.finish(),
+        })
     }
 }
 
-/// The finished recording's media reference, or the reason there is none.
-pub async fn finish_recording(
-    recorder: Option<&Recorder>,
-    module_key: &str,
-    call: &Call,
-    state: &ListenState,
-) -> Value {
-    let Some(recorder) = recorder else {
-        return json!({"status": "unavailable", "detail": "no recording store is configured"});
-    };
-    let samples = state.mixed();
-    let duration_ms = samples.len() as u64 * 1000 / u64::from(state.rate.max(1));
-    let wav = audio::wav_wrap(&samples, state.rate);
-    match recorder.write(module_key, &call.call_id, wav).await {
-        Ok((stored, key_id)) => json!({
-            "kind": MEDIA_REFERENCE_KIND,
-            "uri": stored.uri,
-            "sha256": stored.sha256,
-            "bytes": stored.bytes,
-            "durationMs": duration_ms,
-            "format": RECORDING_FORMAT,
-            "rate": state.rate,
-            "channels": 1,
-            "encryption": key_id.map(|id| json!({
-                "scheme": "sutra-sealed-1", "cipher": sealed::CIPHER, "keyId": id
-            })),
-            "consentAnnounced": state.consent_at_ms.is_some(),
-            "consentAnnouncedAtMs": state.consent_at_ms,
-            "truncated": state.truncated,
-            "callId": call.call_id,
-        }),
-        Err(detail) => {
-            tracing::warn!(call_id = %call.call_id, "voip: the recording could not be stored: {detail}");
-            json!({"status": "failed", "detail": detail})
+/// A recording being finished.
+pub struct PendingRecording {
+    pub reference: Value,
+    pub done: oneshot::Receiver<Result<FinishedRecording, String>>,
+}
+
+impl PendingRecording {
+    /// The recording's media reference, once it is stored (or why it is not).
+    pub async fn reference(self, call_id: &str) -> Value {
+        let mut reference = self.reference;
+        match self.done.await {
+            Ok(Ok(stored)) => {
+                reference["uri"] = json!(stored.uri);
+                reference["sha256"] = json!(stored.sha256);
+                reference["bytes"] = json!(stored.bytes);
+                reference["complete"] = json!(true);
+                reference
+            }
+            Ok(Err(detail)) => {
+                tracing::warn!(call_id = %call_id, "voip: the recording could not be stored: {detail}");
+                json!({"status": "failed", "detail": detail, "uri": reference["uri"]})
+            }
+            Err(_) => json!({"status": "failed", "detail": "the recording's uploader stopped"}),
         }
     }
+}
+
+/// The recording outcome of a listen-only / recorded call at its end: the reference of the
+/// recording in progress (finished now), else the last finished one, else why there is none.
+pub async fn finish_recording(
+    recorder: Option<&Recorder>,
+    call: &Call,
+    state: &mut ListenState,
+) -> (Value, Vec<Value>) {
+    if let Some(pending) = state.stop_recording(&call.call_id) {
+        let reference = pending.reference(&call.call_id).await;
+        state.finished.push(reference);
+    }
+    let all = state.finished.clone();
+    let last = match all.last() {
+        Some(last) => last.clone(),
+        None if recorder.is_none() => {
+            json!({"status": "unavailable", "detail": "no recording store is configured"})
+        }
+        None if state.recording_error.is_some() => {
+            json!({"status": "failed", "detail": state.recording_error})
+        }
+        None if state.record_after_consent => {
+            json!({"status": "not-started", "detail": "consent was never given, so nothing was recorded"})
+        }
+        None => json!({"status": "not-started", "detail": "the recording never started"}),
+    };
+    (last, all)
 }
 
 /// Whose track a transcriber hears (a meeting session's participant): its segments are
@@ -512,13 +512,12 @@ async fn transcribe(
 /// The acoustic features of `[start_ms, end_ms)` of the tap, when it holds that audio.
 pub fn segment_features(state: &ListenState, start_ms: u64, end_ms: u64) -> Value {
     let rate = u64::from(state.rate.max(1));
-    let from = (start_ms * rate / 1000) as usize;
-    let to = ((end_ms * rate / 1000) as usize).min(state.tap.len());
-    if from >= to {
+    let audio = state.tap_between(start_ms * rate / 1000, end_ms * rate / 1000);
+    if audio.is_empty() {
         return Value::Null;
     }
     let features = analyze_turn(
-        &state.tap[from..to],
+        audio,
         state.rate,
         20,
         crate::vad::VadConfig::default().energy_threshold,

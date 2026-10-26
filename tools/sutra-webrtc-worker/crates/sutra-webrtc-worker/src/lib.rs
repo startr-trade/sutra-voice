@@ -46,6 +46,33 @@ pub fn flag(name: &str, default: bool) -> Result<bool, String> {
     }
 }
 
+/// The engine's media-stream request: `url` (`SUTRA_WORKER_ENGINE_URL`) with the media token
+/// as an `Authorization: Bearer` header — never in the URL, which proxies and servers log. A
+/// URL that carries a `token` itself is refused.
+pub fn engine_request(
+    url: &str,
+    media_token: &str,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    if url
+        .split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|p| p.starts_with("token=")))
+    {
+        return Err(
+            "SUTRA_WORKER_ENGINE_URL carries a token; the media token goes in SUTRA_WORKER_MEDIA_TOKEN and is sent as a header"
+                .to_string(),
+        );
+    }
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("SUTRA_WORKER_ENGINE_URL: {e}"))?;
+    let value = format!("Bearer {media_token}")
+        .parse()
+        .map_err(|_| "the media token is not a valid header value".to_string())?;
+    request.headers_mut().insert("authorization", value);
+    Ok(request)
+}
+
 /// What a token grants.
 pub struct TokenRequest<'a> {
     pub api_key: &'a str,
@@ -86,4 +113,19 @@ pub fn init_logging() {
         .with_env_filter(filter)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_media_token_rides_in_a_header_not_the_url() {
+        let request = engine_request("ws://engine:8080/voip/stream", "s3cret").unwrap();
+        assert_eq!(request.uri().to_string(), "ws://engine:8080/voip/stream");
+        assert_eq!(request.headers()["authorization"], "Bearer s3cret");
+        assert!(!request.uri().to_string().contains("s3cret"));
+        assert!(engine_request("ws://engine:8080/voip/stream?token=s3cret", "s3cret").is_err());
+        assert!(engine_request("ws://engine:8080/voip/stream", "bad\nvalue").is_err());
+    }
 }

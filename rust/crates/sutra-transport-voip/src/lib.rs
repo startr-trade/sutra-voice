@@ -18,7 +18,8 @@
 //! **Channels** (`transport: voip`, inbound): `call-start` (bound to numbers, see
 //! [`binding`]), `call-turn`, `call-dtmf`, `call-progress`, `call-hangup` — the last one is the
 //! natural session-end message. Every message carries `x-call-id` / `x-called` / `x-caller`.
-//! **Outbound** (`voip://<operation>`): `originate`, `play`, `hangup`, `transfer`, `dtmf`, as
+//! **Outbound** (`voip://<operation>`): `originate`, `play`, `hangup`, `transfer`, `dtmf`,
+//! `record-start`, `record-stop`, as
 //! an outbox sink (the scheme is registered as a reply sink, so a bare `voip://originate` is
 //! qualified with the deployment and the call's events return to it) and as an inline caller
 //! (a synchronous channel-call answers with the minted call id, or the playback outcome).
@@ -36,8 +37,12 @@ pub mod listen;
 pub mod media;
 pub mod meeting;
 pub mod pacing;
+pub mod policy;
 pub mod protocol;
+pub mod recording;
 pub mod rustpbx;
+pub mod store;
+pub mod tokens;
 pub mod vad;
 
 use std::sync::{Arc, RwLock};
@@ -83,6 +88,12 @@ pub mod codes {
     pub const NOT_RUNNING: &str = "SUTRA.VOIP.NOT_RUNNING";
     /// A call is to be recorded but no recording store is configured.
     pub const RECORDING_UNAVAILABLE: &str = "SUTRA.VOIP.RECORDING_UNAVAILABLE";
+    /// `record-start` before consent was given (see [`crate::hub::VoipHub::record_start`]).
+    pub const CONSENT_REQUIRED: &str = "SUTRA.VOIP.CONSENT_REQUIRED";
+    /// An originate the toll-fraud controls refused ([`crate::policy`]).
+    pub const ORIGINATE_REFUSED: &str = "SUTRA.VOIP.ORIGINATE_REFUSED";
+    /// An originate over a rate limit ([`crate::policy`]); retryable.
+    pub const ORIGINATE_RATE_LIMITED: &str = "SUTRA.VOIP.ORIGINATE_RATE_LIMITED";
 }
 
 /// The hub the outbound sink and inline caller reach (they are built by fn-pointer hooks with
@@ -123,6 +134,25 @@ pub fn start_hub(
         });
     }
     hub.pump_gateway_events(events_rx);
+    if let Some(settings) = hub.config().recording.clone() {
+        // Recordings an earlier run left unfinished: at start-up, then periodically.
+        let weak = Arc::downgrade(&hub);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            loop {
+                let Some(hub) = weak.upgrade() else { return };
+                let recovered = hub.sweep_recordings().await;
+                if recovered > 0 {
+                    tracing::info!(recovered, "voip: interrupted recordings recovered");
+                }
+                drop(hub);
+                if settings.sweep_seconds == 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(settings.sweep_seconds)).await;
+            }
+        });
+    }
     Ok(hub)
 }
 

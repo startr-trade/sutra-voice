@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use sutra_transport_voip::audio::{mulaw_encode, pcm16_to_le, wav_wrap};
-use sutra_transport_voip::config::{route_set_of, VoipConfig};
+use sutra_transport_voip::config::route_set_of;
 use sutra_transport_voip::gateway::GenericGateway;
 use sutra_transport_voip::hub::VoipHub;
 use sutra_transport_voip::media::media_router;
@@ -23,7 +23,7 @@ async fn start() -> (
     let (intake, rx) = FakeIntake::new();
     let routes = route_set_of(&definitions(CHANNELS, "billing")).unwrap();
     let hub = VoipHub::new(
-        VoipConfig::generic("ws://unused", Some(TOKEN)),
+        test_config("ws://unused", Some(TOKEN)),
         intake,
         routes,
         Arc::new(GenericGateway),
@@ -70,7 +70,12 @@ async fn bridge_round_trip_start_dtmf_turn_play_hangup() {
             .await;
     assert!(refused.is_err());
 
-    let url = format!("ws://{addr}/voip/bridge?token={TOKEN}&call_id=c1&called=%2B15551230000&caller=%2B14445550000&samplerate=8000&codec=pcm");
+    let url = bridge_url(
+        &hub,
+        addr,
+        "c1",
+        "&called=%2B15551230000&caller=%2B14445550000&samplerate=8000&codec=pcm",
+    );
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let started = next_on(&mut rx, "start").await;
     assert_eq!(started.headers["x-call-id"], "c1");
@@ -206,7 +211,7 @@ async fn bridge_round_trip_start_dtmf_turn_play_hangup() {
 #[tokio::test]
 async fn caller_speech_during_playback_barges_in() {
     let (hub, addr, mut rx) = start().await;
-    let url = format!("ws://{addr}/voip/bridge?token={TOKEN}&call_id=c2&called=15551230000");
+    let url = bridge_url(&hub, addr, "c2", "&called=15551230000");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     next_on(&mut rx, "start").await;
     // 3 s of prompt.
@@ -244,10 +249,7 @@ async fn caller_speech_during_playback_barges_in() {
 #[tokio::test]
 async fn generic_protocol_start_pcmu_clear_and_hangup_frames() {
     let (hub, addr, mut rx) = start().await;
-    let (mut ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/voip/stream?token={TOKEN}"))
-            .await
-            .unwrap();
+    let mut ws = connect_stream(addr, TOKEN).await;
     ws.send(Message::text(
         r#"{"event":"start","callId":"g1","streamId":"s","format":"audio/PCMU","from":"+14445550000","to":"+15551230000","direction":"inbound"}"#,
     ))
@@ -292,7 +294,7 @@ async fn generic_protocol_start_pcmu_clear_and_hangup_frames() {
 #[tokio::test]
 async fn unbound_number_is_rejected_and_unknown_call_play_is_permanent() {
     let (hub, addr, mut rx) = start().await;
-    let url = format!("ws://{addr}/voip/bridge?token={TOKEN}&call_id=c3&called=%2B19990000000");
+    let url = bridge_url(&hub, addr, "c3", "&called=%2B19990000000");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let (_, _, closed) = drain(&mut ws, Duration::from_secs(2)).await;
     assert!(closed);
@@ -345,15 +347,13 @@ async fn wav_turn_body_and_a_requeued_turn_is_redelivered() {
     let (intake, mut rx) = FakeIntake::new();
     let routes = route_set_of(&definitions(&yaml, "billing")).unwrap();
     let hub = VoipHub::new(
-        VoipConfig::generic("ws://unused", Some(TOKEN)),
+        test_config("ws://unused", Some(TOKEN)),
         Arc::clone(&intake) as Arc<dyn sutra_channels::InboundIntake>,
         routes,
         Arc::new(GenericGateway),
     );
     let addr = serve(media_router(Arc::clone(&hub))).await;
-    let url = format!(
-        "ws://{addr}/voip/bridge?token={TOKEN}&call_id=c9&called=%2B15551230000&samplerate=8000"
-    );
+    let url = bridge_url(&hub, addr, "c9", "&called=%2B15551230000&samplerate=8000");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     next_on(&mut rx, "start").await;
     intake.script.lock().unwrap().extend([

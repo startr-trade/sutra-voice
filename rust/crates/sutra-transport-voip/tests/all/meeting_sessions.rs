@@ -17,9 +17,8 @@ use sutra_llm_spi::{
     AudioSession, AudioSessionConfig, AudioSessionEvent, BoxFuture, Diagnostic, LlmFailure,
     LlmProvider, LlmProviderConfig, LlmProviderFactory, LlmRequest, LlmResponse, LlmVideo,
 };
-use sutra_objectstore::{sealed, MemoryObjectStore, ObjectStore, StoreLocation};
 use sutra_transport_voip::audio::{pcm16_to_le, wav_unwrap};
-use sutra_transport_voip::config::{route_set_of, VoipConfig};
+use sutra_transport_voip::config::route_set_of;
 use sutra_transport_voip::gateway::{GatewayControl, GenericGateway};
 use sutra_transport_voip::hub::VoipHub;
 use sutra_transport_voip::listen::Recorder;
@@ -31,6 +30,8 @@ use sutra_transport_voip::meeting::{
 use sutra_transport_voip::protocol::{
     parse_generic_text, parse_tagged, GenericFrame, TaggedHeader, TaggedKind,
 };
+use sutra_transport_voip::recording::open_stream;
+use sutra_transport_voip::store::{MemoryRecordingStore, RecordingStore, StoreLocation};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -300,25 +301,22 @@ async fn a_meeting_session_is_attributed_sampled_analysed_per_role_and_recorded_
     publish_llm_channels(&defs);
     let routes = route_set_of(&defs).unwrap();
     let store =
-        MemoryObjectStore::new(StoreLocation::parse("memory://recordings/meetings").unwrap());
+        MemoryRecordingStore::new(StoreLocation::parse("memory://recordings/meetings").unwrap());
     let recorder = Arc::new(Recorder::new(
-        Arc::new(store.clone()) as Arc<dyn ObjectStore>,
+        Arc::new(store.clone()) as Arc<dyn RecordingStore>,
         Some(KEK),
         "rec-key",
         60,
     ));
     let hub = VoipHub::with_recorder(
-        VoipConfig::generic("ws://unused", Some(TOKEN)),
+        test_config("ws://unused", Some(TOKEN)),
         intake,
         routes,
         Arc::new(GenericGateway) as Arc<dyn GatewayControl>,
         Some(recorder),
     );
     let addr = serve(media_router(Arc::clone(&hub))).await;
-    let (ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/voip/stream?token={TOKEN}"))
-            .await
-            .unwrap();
+    let ws = connect_stream(addr, TOKEN).await;
     let (mut tx, mut from_engine) = ws.split();
     tx.send(Message::text(
         json!({"event": "start", "callId": "standup-1", "streamId": "RM_1",
@@ -530,7 +528,9 @@ async fn a_meeting_session_is_attributed_sampled_analysed_per_role_and_recorded_
             reference["sha256"],
             sutra_objectstore::sha256_hex(&stored).as_str()
         );
-        let (_, wav) = sealed::open(&kek, full, &stored).unwrap();
+        let opened = open_stream(&kek, full, &stored).unwrap();
+        assert!(opened.complete);
+        let wav = opened.plaintext;
         let (samples, rate) = wav_unwrap(&wav).unwrap();
         assert_eq!(rate, RATE);
         assert!(

@@ -34,7 +34,7 @@ use sutra_webrtc_core::protocol::{
 };
 use sutra_webrtc_core::sampler::{FrameSampler, SampleKind};
 use sutra_webrtc_worker::{
-    flag, init_logging, mint_token, number, required, secret_setting, setting,
+    engine_request, flag, init_logging, mint_token, number, required, secret_setting, setting,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -81,26 +81,6 @@ impl Config {
             empty_grace: Duration::from_millis(number("SUTRA_WORKER_EMPTY_GRACE_MS", 3_000u64)?),
             once: flag("SUTRA_WORKER_ONCE", false)?,
         })
-    }
-
-    /// The engine URL with the media token (percent-encoded).
-    fn stream_url(&self) -> String {
-        let separator = if self.engine_url.contains('?') {
-            '&'
-        } else {
-            '?'
-        };
-        let token: String = self
-            .media_token
-            .bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                    (b as char).to_string()
-                }
-                _ => format!("%{b:02X}"),
-            })
-            .collect();
-        format!("{}{separator}token={token}", self.engine_url)
     }
 }
 
@@ -566,7 +546,7 @@ fn announce(
 async fn open_session(config: &Config, shared: &Arc<Shared>) -> Result<Session, String> {
     let (socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio_tungstenite::connect_async(config.stream_url()),
+        tokio_tungstenite::connect_async(engine_request(&config.engine_url, &config.media_token)?),
     )
     .await
     .map_err(|_| "connect timed out".to_string())?

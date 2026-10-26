@@ -63,11 +63,11 @@ async fn play_names_a_recorded_prompt_and_it_is_played_paced() {
     let dir = prompts_dir();
     let (intake, mut rx) = FakeIntake::new();
     let routes = route_set_of(&definitions(CHANNELS, "billing")).unwrap();
-    let mut config = VoipConfig::generic("ws://unused", Some(TOKEN));
+    let mut config = test_config("ws://unused", Some(TOKEN));
     config.prompts_dir = Some(dir.clone());
     let hub = VoipHub::new(config, intake, routes, Arc::new(GenericGateway));
     let addr = serve(media_router(Arc::clone(&hub))).await;
-    let url = format!("ws://{addr}/voip/bridge?token={TOKEN}&call_id=p1&called=15551230000");
+    let url = bridge_url(&hub, addr, "p1", "&called=15551230000");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     next_on(&mut rx, "start").await;
 
