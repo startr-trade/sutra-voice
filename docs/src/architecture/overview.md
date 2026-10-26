@@ -9,13 +9,14 @@ adds only what the engine's extension points allow:
 
 | Part | What it is |
 |---|---|
-| `sutra-transport-voip` | The `voip` transport, registered through the engine's transport SPI: a media WebSocket on the engine's HTTP listener, turn detection, paced playback, number binding, listen-only calls, meeting sessions, segment analysis, and the rustpbx call-control client. |
+| `sutra-transport-voip` | The `voip` transport, registered through the engine's transport SPI: a media WebSocket on the engine's HTTP listener, turn detection, paced playback, number binding, listen-only calls, recordings, meeting sessions cut into media segments, audit events, and the rustpbx call-control client. It analyses nothing: what a meeting's media mean is the flow's. |
 | `sutra-voice-dist` | The composition root: the engine's default bundle plus `voip`, producing the `sutra-voice-engine` binary and image. |
 | `tools/sutra-webrtc-worker` | A separate program, in its own workspace and image, that joins a LiveKit room and streams every participant to the engine. Nothing else links libwebrtc. |
 | `examples/` | Four runnable packages and the stub model server. |
 
-The generic seams the pack relies on stay in the engine: `llm` channels with audio input, the
-`llm` channel registry, `q:audit capture="media"`, the object store, capacity pools and
+The generic seams the pack relies on stay in the engine: `llm` channels with audio input and
+media references, the `llm` channel registry, `q:audit capture="media"`, the object store (with
+multipart uploads, ranged reads and listings), the transport audit journal, capacity pools and
 `session-end`.
 
 ## Components
@@ -31,7 +32,8 @@ flowchart TB
         Voip[voip transport] --> Flow[BPMN process instance]
         Flow --> LLM[llm channels]
         Flow --> Store[Data stores]
-        Voip --> Obj[Object store: recordings]
+        Voip --> Obj[Object store: recordings and segments]
+        LLM -->|media-store reads references| Obj
     end
     LLM --> Model[Model provider]
 ```
@@ -65,16 +67,27 @@ one session per meeting. See [Meetings and the WebRTC worker](meetings.md).
 
 ## Recording and the object store
 
-A call or meeting that is recorded is written to an S3-compatible object store through the engine's
-object-store layer, sealed with envelope encryption by default, capped by a maximum duration, and
-**referenced by hash** from the audit trail (`q:audit capture="media"`), never embedded in it. See
-[Recording and consent](../guides/recording-and-consent.md).
+A call or meeting that is recorded streams to an S3-compatible object store through the engine's
+object store (multipart uploads of sealed one-second chunks, recoverable after a crash), capped by
+a maximum duration, and **referenced by hash** from the audit trail (`q:audit capture="media"`),
+never embedded in it. A meeting's segments are written to the same store, sealed, for the flow to
+hand to a model by reference. See [Recording and consent](../guides/recording-and-consent.md).
+
+## Analysis lives in flows
+
+The transport handles media and computes generic, domain-free measurements (turn and call
+features, acoustic features of a segment). Anything that interprets them, such as an emotion or
+engagement analysis, who may be analysed, the prompt and the fusion of the signals, is in the
+package's BPMN, DMN and FEEL, versioned with the flow and audited like any other step. See
+[Meetings and the WebRTC worker](meetings.md).
 
 ## Every model call is a named channel
 
 The transport has no model settings of its own: a voip channel that names a provider, model or key
-is refused at load. A responder turn, a live transcription and a post-call analysis are all `llm` channels declared in the
-package, with the engine's secret references, retries, redaction and audit. Swapping a provider,
+is refused at load. A responder turn, a live transcription and a segment or post-call analysis are
+all `llm` channels declared in the package, with the engine's secret references, retries,
+redaction and audit. The transport calls one of them itself (the live transcription session); the
+flows call the rest. Swapping a provider,
 or the stub used by the tests, is a channel change and not a code change.
 
 ## Capacity

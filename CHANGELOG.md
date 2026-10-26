@@ -23,6 +23,62 @@ Voice, meeting and video support is a **preview** in this release.
 > preview: the channel keys, the media protocol, the `voip://` operations and the recording
 > format may still change in a minor release.
 
+### Changed — meeting analysis moves into the flows; the engine's object store and audit journal (PREVIEW)
+
+- **The transport no longer analyses meetings.** The `call-analysis` channel and its `analyze.*`
+  keys are removed (refused at load with a pointer to the replacement). A **`call-segment`**
+  channel (`segment.seconds` 2–300, default 10; `segment.max-frames` 0–32, default 8;
+  `segment.roles`, default every role; `segment.default-role`) cuts a meeting session into fixed
+  segments; as each closes, each segmented participant's audio of it (a WAV file) and its sampled
+  frames are written to the recording store as sealed objects (the engine's single-shot
+  `SUTRA-SEALED-1`, which an `llm` channel's `media-store` opens with the same key-encryption
+  key) and one `call-segment` message delivers their media references (`{kind: "media", uri,
+  sha256, participant, startMs, endMs, …}`) with generic measurements: talk time, acoustic
+  features, flagged moments, the words spoken (pseudonymised speakers), who was present. The
+  prompt, the policy (who is analysed), the model call and the fusion of the signals are the
+  flow's. `call-participant` says `segmented` instead of `analysed` / `analysisPolicy`; the
+  meeting `call-hangup` carries `segments` (delivered, failed, skipped) instead of `analysis`.
+- **Bounded memory per meeting participant**: its audio is kept only for a window (the longer of
+  120 s and a segment plus its lag), and frames, transcript lines, voiced spans and flagged
+  moments are let go behind each written segment, so a participant's footprint does not grow with
+  the meeting (a 30-minute, two-person session peaks at about 4.6 MB per participant, as in its
+  first five minutes). A segment's acoustic features are computed off the async workers.
+- **`examples/video-meeting-assistant`**: `segment-analysis.bpmn` decides with
+  `rules/analysis-policy.dmn` (external parties; staff only with the deployment's `allowStaff`
+  switch, false as shipped, and an opt-in), builds the prompt in FEEL, calls `video-analysis`
+  with `{ref, sha256}` parts (`media-store: recordings`, an engine object store over the
+  recording bucket), keeps only the fields it asked for (`removedKeys`) and the modalities that
+  were sent (`unsupportedClaims`), keeps disagreement as reported, and stores the row;
+  `video-meeting.bpmn` applies the same policy to the roster, reads the rows back and computes
+  each participant's digest. The session is `record: after-consent`; `segment.roles: [external]`
+  keeps a staff participant's media from ever being written as a segment.
+  **`examples/meeting-assistant`** uses the same decision table for its internal-staff policy.
+- **`record: true | "after-consent"` on `voip://originate`**: a `capture=media` leg (or one
+  asking `record: true`) can wait for consent like a `record: after-consent` call — the
+  recording starts only once a `play` marked `consent: true` has played to the end. The answer
+  says `record`. The meeting-assistant example dials `record: "after-consent"`.
+- **The engine's object store** replaces the transport's own S3 client (`store.rs`,
+  `RecordingStore`, `S3RecordingStore`, `MemoryRecordingStore` are removed): recordings use
+  `sutra_objectstore::{ObjectStore, S3ObjectStore, MemoryObjectStore}` — multipart uploads,
+  ranged reads, listings — with the same 5 MiB parts, sealed one-second chunks, spool, sweep,
+  manifests and upload markers. The transport no longer depends on `reqwest`.
+- **Audit events through the engine's transport-audit journal**: the transport answers
+  `writes_audit_events() = true`, and writes `voip.ORIGINATE_REFUSED`,
+  `voip.ORIGINATE_RATE_LIMITED`, `voip.CONSENT_REQUIRED`, `voip.RECORDING_RECOVERED` and
+  `voip.RECORDING_RECOVERED_DELIVERED` events to the journal of the instance that owns the call
+  (the routing is kept with the call and in each recording's manifest, so a recovery after a
+  restart still finds it), or to the deployment's. They replace the `sutra.audit` log lines.
+  Fields are written at `payload` level only; a refused destination is masked and sensitive.
+- **Engine pin**: `47ec5ae` (multipart / ranged / listing object store, transport audit events).
+- **Tests**: tier 1 — `audit_events` (refusals, consent and recoveries in the owning instance's
+  journal), `a_long_meeting_holds_bounded_memory_per_participant`,
+  `an_after_consent_session_cuts_no_segment_before_consent`,
+  `an_originated_after_consent_call_records_only_once_the_announcement_has_played`, the segment
+  settings and refusals, and `analysis_flows` (the decision table and the flows' FEEL evaluated
+  with the engine's own evaluators); tier 2 — the MinIO recording suite on the engine's
+  `MinioContainer`, the video meeting with flow-side analysis by reference, and
+  `voip.ORIGINATE_REFUSED` in the instance's `audit_event` rows.
+
 ### Added — durable recordings, consent, credentials out of URLs, toll-fraud controls (PREVIEW)
 
 - **Recordings stream to the store while the call is up** (no longer held in memory until the
@@ -61,7 +117,7 @@ Voice, meeting and video support is a **preview** in this release.
   refused unless named specifically or switched on (`_ALLOW_PREMIUM`, `_ALLOW_INTERNATIONAL`);
   rate limits per destination (`_RATE_PER_DESTINATION`, 10 an hour) and overall
   (`_RATE_GLOBAL`, 60 a minute). Every refusal is a diagnostic (`SUTRA.VOIP.ORIGINATE_REFUSED`,
-  or the retryable `SUTRA.VOIP.ORIGINATE_RATE_LIMITED`) and a `sutra.audit` log event.
+  or the retryable `SUTRA.VOIP.ORIGINATE_RATE_LIMITED`) and an audit event (see above).
 
 ### Added — the repository
 
@@ -112,7 +168,8 @@ Voice, meeting and video support is a **preview** in this release.
   transcription session (`speakerSource: "track"` — exact attribution), speech tracking.
   `call-start` keys `mode: listen`, `record: true`, `video.{fps, enabled, format, max-width,
   quality, extra-frames}`; new inbound kinds `call-participant` and `call-analysis`.
-- **Segment analysis** (`call-analysis` channel, `analyze.*`): fixed time segments; for each
+- **Segment analysis** (superseded before release by `call-segment` and flow-side analysis, see
+  above) (`call-analysis` channel, `analyze.*`): fixed time segments; for each
   segment and each participant whose role is analysed, its segment audio, its frames (requested
   ones first) and the words spoken go to a model with video understanding (through the `llm`
   channel `analyze.channel` names); the answer — expression, engagement, attention, body-language

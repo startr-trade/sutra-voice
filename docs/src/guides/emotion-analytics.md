@@ -5,6 +5,14 @@ channels, for calls (from the caller's audio) and for video meetings (from each 
 and sampled camera frames). Because this is the most regulated thing the project does, the defaults
 are restrictive and the restrictions are enforced by the software where possible.
 
+## Where it is decided
+
+The voip transport analyses nothing. For a call it delivers the caller's turns and generic
+acoustic features; for a meeting it writes each participant's media segment by segment and hands
+the flow references. The policy, the prompt, the model call and the reading of the answer are all
+in the example flows, as BPMN, DMN and FEEL that ship with the package and are audited like any
+other step.
+
 ## Who is analysed
 
 - **Customers and external participants by default.** The call examples analyse the customer's
@@ -12,21 +20,34 @@ are restrictive and the restrictions are enforced by the software where possible
   the call to the PBX.
 - **Staff only by explicit opt-in.** Inferring the emotions of people at work is prohibited in the
   EU (AI Act, Article 5(1)(f)), which includes contact-centre agents and colleagues in an internal
-  meeting. In the meeting worker a staff role listed in `analyze.roles` without
-  `analyze.allow-staff: true` fails the channel at load. Enable it only where the prohibition does not
-  apply and the people concerned agreed, and document why it is lawful there.
+  meeting. The meeting examples decide with a decision table, `rules/analysis-policy.dmn`: an
+  external party is analysed; a staff role (`staff`, `internal`, `employee`, `agent`, `host`) only
+  when the deployment's switch (`allowStaff` in the video example, `internalAnalysisAllowed` in
+  the dial-in one, both false as shipped) is on AND the people concerned opted in; anyone else,
+  including a participant with no declared role, is not. Turn the switch on only where the
+  prohibition does not apply, and document why it is lawful there.
+- **Two gates in a video meeting.** The `call-segment` channel's `segment.roles` limits who is cut
+  into segments at all (`[external]` in the example), so a staff participant's media is never
+  even written as a segment; the flow's table then decides again for every segment.
 - **Roles are declared, never inferred.** Whoever issues the room token sets the role attribute.
-- **A participant who is not analysed never reaches the model.** None of their audio or frames is
-  sent, and their frames are not even kept.
+- **A participant who is not analysed never reaches the model.** No media of theirs is sent; the
+  analysis row says `not-analysed` and why.
 
-## What the model is asked, and not asked
+## What the model is asked, and what is kept
 
-- **No identification and no sensitive attributes.** The model sees pseudonyms (`P1`, `P2`), is told
-  not to identify anyone or infer age, gender, ethnicity, health, religion, political or sexual
-  orientation, and any key carrying such an inference is stripped from its answer (listed in
-  `removedKeys`).
-- **Frames are not retained.** They live in memory until their segment has been analysed, and are
-  never stored. Recordings are audio only, sealed, referenced by hash.
+- **No identification and no sensitive attributes.** The flow's prompt names pseudonyms (`P1`,
+  `P2`) and tells the model not to identify anyone or infer age, gender, ethnicity, health,
+  religion, political or sexual orientation. The flow then keeps only the fields it asked for:
+  anything else in the answer is dropped and listed in `removedKeys`.
+- **Only what was sent counts.** A signal (voice, face, body, words) the model claims for an
+  emotion but that was not sent is false, not guessed (`unsupportedClaims`); an emotion no sent
+  signal supports is withheld.
+- **Disagreement is reported, never averaged.** When the signals disagree (a calm voice, a tense
+  posture) the row keeps the model's `disagreement`, and the report counts the segments it
+  happened in.
+- **Media are referenced, sealed and erasable.** Recordings are audio only. A segment's audio and
+  frames are sealed objects in the recording store, named by SHA-256 in the flow's variables and
+  audit events (`capture="media"`), so subject erasure and retention delete them.
 
 ## Advisory, not a decision
 

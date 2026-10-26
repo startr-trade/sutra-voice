@@ -28,21 +28,45 @@ sequenceDiagram
     T->>F: call-participant (join / leave)
     T->>F: call-transcript, call-keyword
     loop each segment
-        T->>M: analyse (analysed participants only)
-        T->>F: call-analysis
+        T->>O: write the segment's audio and frames (sealed)
+        T->>F: call-segment (media references)
+        F->>F: policy (DMN): analysed?
+        F->>M: analyse, media as {ref, sha256}
+        M->>O: read, check digest, open
+        F->>F: fuse (FEEL), store the row
     end
     R-->>W: room empty
     W->>T: end session
     T->>F: call-hangup (transcript, recordings)
-    F->>M: minutes, report
+    F->>F: digest, report
 ```
 
-Only the sparse events reach the flow, not raw audio: a participant joining, a phrase being heard,
-a segment's analysis, the end of the meeting. After the end, the flow reads the transcript back,
-asks a model for the minutes and stores or sends the report.
+Only sparse events and references reach the flow, never media: a participant joining, a phrase
+being heard, a segment's references, the end of the meeting. The transport handles media and
+generic measurements only; everything that interprets them is in the flow.
+
+## Where the analysis lives
+
+| Concern | Where |
+|---|---|
+| Cutting each participant's media into segments, writing them sealed, generic acoustic features | the transport (`call-segment`) |
+| Who is analysed, and why not | the flow: a decision table (`rules/analysis-policy.dmn`) |
+| The prompt, the model and its fallback | the flow (FEEL) and an `llm` channel with a `media-store` |
+| Which signals support an emotion, what to keep of the answer, disagreement | the flow (FEEL) |
+| The per-participant digest and the report | the flow (FEEL, a template) |
+
+So a prompt or a policy changes with a package version, not an engine upgrade, and every decision
+is a step in the instance's audit trail.
+
+## Memory
+
+Per participant the transport holds a bounded window of audio and only the frames, transcript
+lines and flagged moments of segments not yet written, so its memory does not grow with the length
+of the meeting. Recordings stream to the store.
 
 ## Who is analysed
 
-The role of each participant is declared by whoever issues the room token, never inferred. A
-participant who is not analysed never reaches the model. See
+The role of each participant is declared by whoever issues the room token, never inferred. The
+`call-segment` channel cuts only the roles it lists, and the flow's policy decides who of those is
+analysed; a participant who is not analysed never has media sent to a model. See
 [Emotion analytics and compliance](../guides/emotion-analytics.md).

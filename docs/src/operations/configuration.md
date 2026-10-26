@@ -12,17 +12,24 @@ In groups:
 |---|---|
 | Gateway | `SUTRA_VOIP_GATEWAY` (`generic` or `rustpbx`), `SUTRA_VOIP_TRUNK` |
 | Call control (rustpbx) | `SUTRA_VOIP_RWI_URL`, `SUTRA_VOIP_RWI_TOKEN`, `SUTRA_VOIP_RWI_CA_FILE` |
-| Media | `SUTRA_VOIP_PUBLIC_MEDIA_URL`, `SUTRA_VOIP_MEDIA_TOKEN`, `SUTRA_VOIP_BRIDGE_RATE` |
+| Media | `SUTRA_VOIP_PUBLIC_MEDIA_URL`, `SUTRA_VOIP_MEDIA_TOKEN`, `SUTRA_VOIP_BRIDGE_TOKEN_TTL_SECONDS`, `SUTRA_VOIP_BRIDGE_RATE` |
 | Prompts | `SUTRA_VOIP_PROMPTS_DIR` |
-| Recording | `SUTRA_VOIP_RECORDING_STORE`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY`, `_SECRET_KEY`, `_CREATE_BUCKET`, `_ENCRYPTION`, `_KEK`, `_KEY_ID`, `_MAX_SECONDS` |
+| Recording | `SUTRA_VOIP_RECORDING_STORE`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY`, `_SECRET_KEY`, `_CREATE_BUCKET`, `_ENCRYPTION`, `_KEK`, `_KEY_ID`, `_MAX_SECONDS`, `_SPOOL_DIR`, `_SWEEP_SECONDS`; `SUTRA_VOIP_INSTANCE_ID` |
+| Originate (toll fraud) | `SUTRA_VOIP_ORIGINATE_ALLOW` (none: every originate refused), `_HOME_PREFIX`, `_ALLOW_INTERNATIONAL`, `_ALLOW_PREMIUM`, `_BLOCK_PREFIXES`, `_RATE_PER_DESTINATION`, `_RATE_GLOBAL` |
 
-Channel-level settings (turn detection, `mode`, `record`, `transcribe`, `analyze`, `video.*`,
+Channel-level settings (turn detection, `mode`, `record`, `transcribe`, `segment.*`, `video.*`,
 `phrases`, `pool`, `session-end`) are keys on the package's channels, described in the guides.
+
+A flow that analyses meeting segments reads them through an `llm` channel's `media-store`, which
+names an engine object store (`SUTRA_OBJECT_STORES`, `SUTRA_OBJECT_STORES_<NAME>_URI`, `_ENDPOINT`,
+`_ACCESS_KEY`, `_SECRET_KEY`, `_KEK`, `_KEY_ID`) declared over the recording bucket with the
+recording KEK.
 
 ## Engine (general)
 
 `SUTRA_DEPLOYMENTS_DIR`, `SUTRA_HTTP_PORT`, `SUTRA_DATASOURCE_*` and the capacity-pool settings
-(`SUTRA_CAPACITY_POOLS`, `SUTRA_CAPACITY_POOLS_<NAME>_SLOTS`, ...) belong to the engine. See the
+(`SUTRA_CAPACITY_POOLS`, `SUTRA_CAPACITY_POOLS_<NAME>_SLOTS`, ...), the object stores and the
+audit sinks (`SUTRA_AUDIT_SQL`) belong to the engine. See the
 [Sutra configuration reference](https://sutra.startr.trade/operating/configuration.html).
 
 ## WebRTC worker

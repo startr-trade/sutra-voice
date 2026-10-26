@@ -5,7 +5,7 @@ key into an extension and an access rule, customer lookup, PIN entry with retrie
 extensions, and a log of every outcome (never the digits). The whole call is one instance of one
 BPMN process whose menu and PIN loops are real loops.
 
-It is the example used in the [Quick start](../quick-start.md), runs with rustpbx and SIPp, and
+Its walkthrough is the [Quick start](../quick-start.md), run against the real stack. It runs with rustpbx and SIPp, and
 includes a table of calls that exercise every path: an open extension, a customer, a valid, an
 inactive and an expired PIN, three wrong PINs, an invalid choice, and no choice at all.
 

@@ -48,7 +48,8 @@ One gateway per engine, configured through environment variables. Secrets are re
 | `SUTRA_VOIP_RWI_TOKEN` | its bearer token — a reference | required for `rustpbx` |
 | `SUTRA_VOIP_RWI_CA_FILE` | extra trusted CA certificates (PEM) for a `wss://` PBX with a private CA | the platform's roots |
 | `SUTRA_VOIP_PUBLIC_MEDIA_URL` | how the gateway reaches this engine, `ws://engine:8080` | `ws://localhost:8080` |
-| `SUTRA_VOIP_MEDIA_TOKEN` | the token every media and webhook request must carry as `?token=` — a reference | none: every media request is refused |
+| `SUTRA_VOIP_MEDIA_TOKEN` | the deployment's media credential — a reference. A `/voip/stream` client sends it as `Authorization: Bearer`; the PBX's webhook and IVR-step URLs carry it as `?token=` (or the header). The PCM bridge never sees it (see [Media credentials](#media-credentials)) | none: every media request is refused |
+| `SUTRA_VOIP_BRIDGE_TOKEN_TTL_SECONDS` | how long a bridge token minted for one call is valid (each opens one bridge socket) | `60` |
 | `SUTRA_VOIP_BRIDGE_RATE` | the PCM sample rate asked of the bridge (≥ 8000) | `8000` |
 | `SUTRA_VOIP_TRUNK` | the gateway trunk originated calls use (a request may name another) | none |
 | `SUTRA_VOIP_PROMPTS_DIR` | the directory recorded prompts are played from (`play` with `prompt`); must exist | none: a prompt play is refused |
@@ -61,9 +62,28 @@ One gateway per engine, configured through environment variables. Secrets are re
 | `SUTRA_VOIP_RECORDING_KEK` | the key-encryption key recordings are sealed under — a reference | required with `envelope` |
 | `SUTRA_VOIP_RECORDING_KEY_ID` | the key id a sealed recording names | `recordings` |
 | `SUTRA_VOIP_RECORDING_MAX_SECONDS` | the longest recording kept (audio beyond it is not recorded) | `7200` |
+| `SUTRA_VOIP_RECORDING_SPOOL_DIR` | where each recording's part in progress is spooled (sealed) until it is uploaded, so a crash loses at most a chunk; `none` holds parts in memory | `<temp dir>/sutra-voip-spool` |
+| `SUTRA_VOIP_RECORDING_SWEEP_SECONDS` | how often interrupted recordings are looked for (and once at start-up); `0`: at start-up only | `600` |
+| `SUTRA_VOIP_INSTANCE_ID` | who writes a recording, stable across restarts of the same host (the sweep recovers its own recordings at once, another host's only once they are stale); distinct per process sharing a host | `HOSTNAME` |
+| `SUTRA_VOIP_ORIGINATE_ALLOW` | the destinations `originate` may dial: glob patterns (`+1555*`, `sip:*@pbx.internal`, `*`), comma-separated | none: **every originate is refused** |
+| `SUTRA_VOIP_ORIGINATE_HOME_PREFIX` | the home numbering plan (`+1`): a `+` number outside it is international | none: every `+` number is international |
+| `SUTRA_VOIP_ORIGINATE_ALLOW_INTERNATIONAL` | dial international numbers the allow-list covers only by a broad pattern | `false` |
+| `SUTRA_VOIP_ORIGINATE_ALLOW_PREMIUM` | dial premium-rate numbers | `false` |
+| `SUTRA_VOIP_ORIGINATE_BLOCK_PREFIXES` | the premium-rate prefixes refused, comma-separated | a built-in list |
+| `SUTRA_VOIP_ORIGINATE_RATE_PER_DESTINATION` | originates to one destination per hour (`0`: unlimited) | `10` |
+| `SUTRA_VOIP_ORIGINATE_RATE_GLOBAL` | originates in total per minute (`0`: unlimited) | `60` |
 
-The media token rides in the URL because a PBX's bridge client sends no custom headers. Use TLS
-(`wss://`) between gateway and engine anywhere outside a private network.
+Use TLS (`wss://`) between gateway and engine anywhere outside a private network.
+
+### Media credentials
+
+| Route | Credential |
+|---|---|
+| `GET /voip/stream` (the media-stream protocol) | the media token as `Authorization: Bearer <token>`. A token in the URL is **refused**: URLs end up in proxy and server logs. |
+| `GET /voip/bridge` (the PCM bridge a PBX dials) | `?token=<bridge token>`: minted by the engine for that one call when it hands the call to the bridge, valid for `SUTRA_VOIP_BRIDGE_TOKEN_TTL_SECONDS` and for one socket. It is an HMAC over the call id, its expiry and a nonce, keyed from the media token, so it is useless for any other call and never reveals the media token. A client that can send headers may use the bearer media token instead. |
+| `POST /voip/rustpbx/webhook`, `POST /voip/rustpbx/ivr-step` | the media token as `?token=` (a PBX's webhook client sends no headers) or as the bearer header. |
+
+Tokens are redacted from the transport's log lines.
 
 ## Channels
 
@@ -81,6 +101,8 @@ Each inbound channel declares `transport: voip` and the event it receives with `
 | `call-hangup` | the call ended, for any reason | `{callId, reason, hangupBy, sipStatus, durationMs, features}`; a listen-only or recorded call adds `mode`, `transcript` and `recording` (see [Listen-only calls](#listen-only-calls)) |
 | `call-transcript` | one final transcript segment of a listen-only call | `{callId, seq, key, itemId, speaker, speakerSource, startMs, endMs, text, provider, model, features}` |
 | `call-keyword` | a `phrases:` entry was heard in a segment | `{callId, phrase, segmentSeq, atMs, text}` |
+| `call-participant` | a participant of a meeting session joined or left | see [The WebRTC worker](webrtc-worker.md#channels) |
+| `call-segment` | one participant's media over one segment of a meeting session, as references | see [The WebRTC worker](webrtc-worker.md#segments-media-for-the-flow) |
 
 ```yaml
 channels:
@@ -120,11 +142,13 @@ computed from the audio, with no model involved.
 
 | Operation | Body | Answer (as a synchronous call) |
 |---|---|---|
-| `originate` | `{callId?, destination, callerId?, timeoutSecs?, trunk?, headers?, mode?: "listen", dtmfAfterAnswer?, dtmfDelayMs?}` | `{callId, status: "originating", mode, recorded}` |
+| `originate` | `{callId?, destination, callerId?, timeoutSecs?, trunk?, headers?, mode?: "listen", record?: true \| "after-consent", dtmfAfterAnswer?, dtmfDelayMs?}` | `{callId, status: "originating", mode, recorded, record}` |
 | `play` | `{callId, audio: {data: <base64>, format}}`, or `{callId, prompt: "<name>"}` (a recorded prompt), or the audio itself as the body, with `x-call-id`; `consent: true` marks the recording/transcription announcement | `{callId, playedMs, interrupted}` once played |
 | `hangup` | `{callId, reason?}` | `{callId, status: "hung-up"}` |
 | `transfer` | `{callId, target}` — an extension or SIP URI on the PBX | `{callId, status: "transferred", target}` |
 | `dtmf` | `{callId, digits, gapMs?}` — `0-9`, `*`, `#`, `A-D`, one every `gapMs` (250) | `{callId, sent}` — never the digits (a PIN is a secret) |
+| `record-start` | `{callId, consent?: true}` — start recording now; refused (`SUTRA.VOIP.CONSENT_REQUIRED`) until consent was given | `{callId, status: "recording", uri, startMs, consent: "announced" \| "asserted"}` |
+| `record-stop` | `{callId}` — stop the recording in progress | `{callId, status: "stopped", recording: <media reference>}` |
 
 - **`play`** takes any format the audio module knows (`audio/wav`, `audio/L16;rate=<hz>`,
   `audio/PCMU`, `audio/PCMA`) and resamples it to the call's rate — so a model's spoken answer
@@ -138,6 +162,16 @@ computed from the audio, with no model involved.
 - **`originate`**: the flow may name the call itself (`callId`), so it can correlate before the
   PBX knows the call; otherwise an id is minted from the outbox entry, so a redelivery never
   dials twice. A bare number (`+15550001111`) is dialled through the trunk.
+- **Toll-fraud controls.** `originate` is **deny-all** until `SUTRA_VOIP_ORIGINATE_ALLOW` lists
+  the destinations it may dial. Premium-rate prefixes and international numbers are refused unless
+  allowed explicitly, and per-destination and global rate limits apply. A refusal is a permanent
+  failure (`SUTRA.VOIP.ORIGINATE_REFUSED`), a rate limit a retryable one
+  (`SUTRA.VOIP.ORIGINATE_RATE_LIMITED`); both are written to the audit journal
+  ([Audit events](#audit-events)) with the destination masked.
+- **Recording an originated call.** A request from a `<q:audit capture="media">` process is
+  recorded (or one saying `record: true`). `record: "after-consent"` makes the recording wait for
+  consent, like a `record: after-consent` channel: it starts only once a `play` marked
+  `consent: true` has played to the end. See [Recording and consent](recording-and-consent.md).
 - An operation on a call that has just ended answers `status: "ended"` rather than failing — a
   caller hanging up while the flow is mid-step is an ordinary race.
 
@@ -150,17 +184,11 @@ the transport, and two consumers share the far end's audio:
 - **Recording.** A call whose originate request comes from a `<q:audit capture="media">` process
   (the engine marks the request `sutra-audit-capture: media`) is recorded: the far end's audio,
   filled with silence where the gateway sent nothing (so the recording keeps the call's clock), with
-  the transport's own prompts mixed in where they played. At the hang-up it is written once, as
-  `audio/wav`, to `SUTRA_VOIP_RECORDING_STORE` under `<tenant>/<module>/<version>/<callId>.wav`,
-  sealed (`.sealed`: a fresh data key per recording, wrapped under `SUTRA_VOIP_RECORDING_KEK`)
-  unless the encryption is `none`. The `call-hangup` carries the REFERENCE:
-  `recording: {kind: "media", uri, sha256, bytes, durationMs, format, rate, channels, encryption:
-  {scheme, cipher, keyId}, consentAnnounced, consentAnnouncedAtMs, truncated, callId}` — `sha256`
-  is the stored object's, so its integrity can be checked without the key. The process's audit
-  events carry the same reference (never the audio). A store that cannot be written answers
-  `recording: {status: "failed", detail}`; a call to be recorded with no store configured is
-  refused (`SUTRA.VOIP.RECORDING_UNAVAILABLE`). Recording is in memory until the hang-up (8 kHz
-  mono: about 58 MB an hour), bounded by `SUTRA_VOIP_RECORDING_MAX_SECONDS`.
+  the transport's own prompts mixed in where they played. It streams to
+  `SUTRA_VOIP_RECORDING_STORE` while the call is up, sealed chunk by chunk, and survives a crash;
+  the `call-hangup` carries its REFERENCE (`recording`, and every recording of the call in
+  `recordings`). How it is written, sealed, recovered and gated on consent:
+  [Recording and consent](recording-and-consent.md).
 - **Live transcription.** A `call-transcript` channel opens a live audio session for each
   listen-only call, transcription-only (it never answers), THROUGH the `llm` channel of the same
   deployment that `transcribe.channel` names — the model, its key and any fallback are configured
@@ -216,10 +244,11 @@ the far leg as RFC 2833 telephone events. `examples/meeting-assistant` is the wh
 
 A gateway that sits in a meeting as a participant can stream every other participant on ONE
 socket of the generic protocol — each participant's own audio and sampled camera frames — and the
-transport records, transcribes and analyses each participant separately. The protocol extension,
-the channel keys (`mode`, `record`, `video.*` on the `call-start` channel; the
-`call-participant` and `call-analysis` channels) and the WebRTC worker that does this for a
-LiveKit room are described in [Video meetings (WebRTC worker)](webrtc-worker.md).
+transport records and transcribes each participant separately, and cuts each one's media into
+segments it hands the flow as references. The transport does not analyse: the flow decides what to
+analyse and calls the model. The protocol extension, the channel keys (`mode`, `record`, `video.*`
+on the `call-start` channel; the `call-participant` and `call-segment` channels) and the WebRTC
+worker that does this for a LiveKit room are described in [The WebRTC worker](webrtc-worker.md).
 
 ## Lines: capacity pools and session-end
 
@@ -322,10 +351,36 @@ follows the source.
 - Realtime speech-to-speech (media straight between the call and a model's live API, the flow as
   the control plane) is not part of this transport.
 
+## Audit events
+
+The transport writes its own events to the engine's audit journal, through the engine's
+transport-audit interface: it answers `writes_audit_events() = true`, so the engine stamps every
+request it receives with the audit routing of the instance that sent it. An event about a call
+goes to the journal of the instance that owns the call (an inbound call learns it from the first
+request of its instance; a recording keeps it in its manifest, so a recovery after a restart still
+writes there). An event no instance owns goes to the deployment's journal.
+
+| Event type | When | Fields |
+|---|---|---|
+| `voip.ORIGINATE_REFUSED` | the toll-fraud controls refused an originate | `rule`, `callId`, `destination` (masked, and sensitive: redacted in the journal) |
+| `voip.ORIGINATE_RATE_LIMITED` | an originate over a rate limit | the same |
+| `voip.CONSENT_REQUIRED` | a `record-start` refused for want of consent | `callId` |
+| `voip.RECORDING_RECOVERED` | the sweep completed an interrupted recording (or aborted an empty one) | `callId`, `key`, `capturedMs`, `complete` |
+| `voip.RECORDING_RECOVERED_DELIVERED` | a recovered recording's reference was delivered to the call's flow | `callId`, `recordings`, `decision` |
+
+The fields are written only when the process audits at `payload` level; at any other level the
+event keeps its type, diagnostic code and time with an empty payload. With no audit sink, or a
+process that is not audited, nothing is written. In `audit_event` (`SUTRA_AUDIT_SQL=true`) the rows
+carry `event_type` `voip.<EVENT>` and the instance's id.
+
 ## Diagnostics
 
 `SUTRA.VOIP.BIND_INVALID`, `SUTRA.VOIP.BIND_DUPLICATE` (number binding), `SUTRA.VOIP.CHANNEL_INVALID`
 (a channel's settings), `SUTRA.VOIP.CONFIG_INVALID` (the environment), `SUTRA.VOIP.OUTBOUND_INVALID`
 (a request), `SUTRA.VOIP.CALL_UNKNOWN`, `SUTRA.VOIP.CALL_NOT_CONNECTED` (no media yet — retried),
 `SUTRA.VOIP.AUDIO_INVALID`, `SUTRA.VOIP.GATEWAY_UNAVAILABLE` (retried), `SUTRA.VOIP.GATEWAY_REJECTED`,
-`SUTRA.VOIP.NOT_RUNNING`, `SUTRA.VOIP.RECORDING_UNAVAILABLE` (a call to be recorded, no store).
+`SUTRA.VOIP.NOT_RUNNING`, `SUTRA.VOIP.RECORDING_UNAVAILABLE` (a call to be recorded, no store),
+`SUTRA.VOIP.CONSENT_REQUIRED` (`record-start` before consent), `SUTRA.VOIP.ORIGINATE_REFUSED`,
+`SUTRA.VOIP.ORIGINATE_RATE_LIMITED` (retried), `SUTRA.VOIP.RECORDING_RECOVERED` (on the recovery
+audit events), `SUTRA.VOIP.MODEL_CHANNEL_INVALID` (a `transcribe.channel` that is not a usable
+`llm` channel).

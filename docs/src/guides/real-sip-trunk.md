@@ -41,6 +41,14 @@ premium-rate and international numbers at your expense.
 - Never leave default or example passwords on extensions or trunks.
 - Restrict outbound destinations (country and premium-rate prefixes) at the PBX and at the carrier.
   Flows that dial numbers supplied by users should validate them first.
+- The engine refuses too: `voip://originate` dials nothing until `SUTRA_VOIP_ORIGINATE_ALLOW`
+  lists what it may (glob patterns such as `+1555*`, or `sip:*@pbx.internal`). Premium-rate
+  prefixes (`SUTRA_VOIP_ORIGINATE_BLOCK_PREFIXES`, a built-in list) and international numbers
+  (outside `SUTRA_VOIP_ORIGINATE_HOME_PREFIX`) are refused unless an allow pattern names them
+  specifically or `_ALLOW_PREMIUM` / `_ALLOW_INTERNATIONAL` is `true`; each destination may be
+  dialled `_RATE_PER_DESTINATION` times an hour (10) and all of them `_RATE_GLOBAL` times a
+  minute (60). Every refusal is a `voip.ORIGINATE_REFUSED` or `voip.ORIGINATE_RATE_LIMITED` event
+  in the requesting instance's audit trail.
 - Set a spending limit and call-rate alerts with the carrier, and use the capacity pool to cap
   concurrent calls.
 - Watch call records for unusual destinations and off-hours volume.

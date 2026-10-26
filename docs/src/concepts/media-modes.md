@@ -5,7 +5,7 @@
 | Source | A PBX conference, dialled in over SIP | A LiveKit room through the WebRTC worker |
 | What the engine receives | One stream carrying everyone | One tagged stream per participant, plus sampled camera frames |
 | Transcript speakers | `unknown`, unless the provider labels them | Per participant, from that participant's own track |
-| Per-participant analysis | Not possible | Yes, for analysed roles only |
+| Per-participant analysis | Not possible | Yes: the flow analyses each segment it is handed (`call-segment`), for analysed roles only |
 | Recording | One recording of the mix | One recording per participant, audio only |
 
 A conference dial-in is one mixed channel, so a live transcription cannot say who spoke. Providers

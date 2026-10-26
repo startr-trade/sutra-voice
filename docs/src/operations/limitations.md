@@ -20,10 +20,16 @@ Voice, meeting and video support is a **preview** in 0.6. This page says what th
   late.
 - **Video is not available through rustpbx**: its media bridge is audio only. Video comes through the
   WebRTC worker.
-- **Worker:** no video recording (recordings are audio only; frames are analysed and dropped), no
-  phone participants through LiveKit SIP, one room per worker.
+- **Worker:** no video recording (recordings are audio only; only the sampled frames of segmented
+  participants are written, as segment media), no phone participants through LiveKit SIP, one room
+  per worker.
 - **Dial-in transcripts do not label speakers** (one mixed channel).
-- **Recording is in memory** until the hang-up, bounded by `SUTRA_VOIP_RECORDING_MAX_SECONDS`.
+- **A recording's length** is capped by `SUTRA_VOIP_RECORDING_MAX_SECONDS` (it streams to the
+  store, so memory does not grow with it). A recording interrupted by a crash is recovered by the
+  sweep with what reached the spool or the store; the audio of the last chunk in flight is lost.
+- **Meeting analysis is the flow's:** the transport delivers segments as media references and
+  generic measurements; the prompt, the policy and the fusion are in the example flows, and their
+  quality is the model's and the flow's.
 - **Not a media server:** no conferencing, mixing or transcoding beyond PCM16 and G.711 handling.
 - **Prompts in the IVR example are tones, not speech;** replace them with recordings.
 - **Legal compliance is yours:** the software provides disclosure and restriction hooks, not a
