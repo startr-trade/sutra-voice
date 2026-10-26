@@ -67,6 +67,8 @@
         <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>allowStaff</bpmn:to></bpmn:assignment>
         <!-- No per-participant opt-in is collected in this example. -->
         <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>optedIn</bpmn:to></bpmn:assignment>
+        <!-- The transport wrote the segment's media (an audio file, or at least one frame). -->
+        <bpmn:assignment><bpmn:from>segment.status = "complete" and (segment.audio != null or count(segment.frames) &gt; 0)</bpmn:from><bpmn:to>withMedia</bpmn:to></bpmn:assignment>
       </bpmn:dataInputAssociation>
     </bpmn:serviceTask>
     <bpmn:sequenceFlow id="F_prepared" sourceRef="Prepare" targetRef="Policy"/>
@@ -82,7 +84,7 @@
       <bpmn:outgoing>F_not_analysed</bpmn:outgoing>
     </bpmn:exclusiveGateway>
     <bpmn:sequenceFlow id="F_analyse" name="yes" sourceRef="Analysed" targetRef="BuildRequest">
-      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">analysed = true and segment.status = "complete" and (segment.audio != null or count(segment.frames) &gt; 0)</bpmn:conditionExpression>
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">analysed = true and withMedia = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="F_not_analysed" sourceRef="Analysed" targetRef="NotAnalysed"/>
 

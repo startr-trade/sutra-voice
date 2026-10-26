@@ -133,6 +133,10 @@ fn segment() -> Value {
 fn the_segment_prompt_sends_the_media_as_references_and_names_pseudonyms_only() {
     let bpmn = example("video-meeting-assistant/shared/bpmn/segment-analysis.bpmn");
     let mut vars = json!({"segment": segment()});
+    assert_eq!(eval(&assignment(&bpmn, "withMedia"), &vars), json!(true));
+    let mut failed = vars.clone();
+    failed["segment"]["status"] = json!("failed");
+    assert_eq!(eval(&assignment(&bpmn, "withMedia"), &failed), json!(false));
     vars["promptContext"] = eval(&assignment(&bpmn, "promptContext"), &vars);
     let context = &vars["promptContext"];
     assert_eq!(context["speaking"], true, "{context}");
