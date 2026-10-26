@@ -11,11 +11,16 @@ changes — `llm` channels, audio in the provider SPI, capacity pools, wait stat
 store, `q:audit capture="media"` — are in the
 [engine changelog](https://github.com/startr-trade/sutra/blob/main/rust/CHANGELOG.md).
 
-## [0.6.0] — Unreleased
+## [Unreleased]
 
-The first release. The code below was built inside the engine repository during the 0.6.0 cycle
-and moved here, before that release, as a separate repository: the engine stays free of
-telephony and video, and this repository adds them through the engine's transport SPI.
+Nothing yet.
+
+## [0.6.0] — 2026-10-26
+
+The first release, pinned to engine `v0.6.0` (`eb288d5`). The code below was built inside the
+engine repository during the 0.6.0 cycle and moved here, before that release, as a separate
+repository: the engine stays free of telephony and video, and this repository adds them
+through the engine's transport SPI.
 
 Voice, meeting and video support is a **preview** in this release.
 
@@ -69,7 +74,8 @@ Voice, meeting and video support is a **preview** in this release.
   (the routing is kept with the call and in each recording's manifest, so a recovery after a
   restart still finds it), or to the deployment's. They replace the `sutra.audit` log lines.
   Fields are written at `payload` level only; a refused destination is masked and sensitive.
-- **Engine pin**: `47ec5ae` (multipart / ranged / listing object store, transport audit events).
+- **Engine pin**: `eb288d5`, the engine's `v0.6.0` release (multipart / ranged / listing object
+  store, transport audit events).
 - **Tests**: tier 1 — `audit_events` (refusals, consent and recoveries in the owning instance's
   journal), `a_long_meeting_holds_bounded_memory_per_participant`,
   `an_after_consent_session_cuts_no_segment_before_consent`,
