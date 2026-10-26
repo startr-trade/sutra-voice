@@ -160,7 +160,7 @@ echo "the engine is on port $PORT"
 
 ```text
 packaged examples/meeting-assistant/deploy/deployments/meeting-stub.sutra (deploymentId dep-8ef8bcdca12f51cc8c078bf1)
-the engine is on port 32995
+the engine is on port 33003
 ```
 
 (`sutra package` also prints three warnings about the schema-less JSON channels; the `grep`
@@ -200,13 +200,13 @@ for k in ["kind", "uri", "format", "durationMs", "startMs", "consentAnnounced", 
 kind: "media"
 uri: "s3://meeting-recordings/calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed"
 format: "audio/wav"
-durationMs: 22995
-startMs: 2617
+durationMs: 23006
+startMs: 2612
 consentAnnounced: true
-consentAnnouncedAtMs: -1581
+consentAnnouncedAtMs: -1582
 complete: true
 encryption: {"cipher": "aes-256-gcm", "keyId": "recordings", "scheme": "sutra-sealed-stream-1"}
-sha256: "829bf816c534c718a1e310b561220d4747d1257242baec7cbb414beebdfd673f"
+sha256: "ac3d2789346ac5737beec078a2648d969cf7d523998167e9cdb4719d4192f199"
 ```
 
 `startMs` is where in the call the recording began, 2.6 s after the media connected: after the PIN
@@ -224,8 +224,8 @@ docker compose -f $C exec -T recordings mc ls -r local/meeting-recordings
 ```
 
 ```text
-[2026-10-26 07:20:33 UTC] 360KiB STANDARD calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed
-[2026-10-26 07:20:33 UTC]   983B STANDARD calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed.json
+[2026-10-26 07:29:48 UTC] 360KiB STANDARD calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed
+[2026-10-26 07:29:48 UTC]   983B STANDARD calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed.json
 ```
 
 The recording and its manifest. No marker is left under `sutra-voip-uploads/`: the upload
@@ -254,11 +254,12 @@ sealed: true
 keyId: "recordings"
 nextPart: 2
 hangupDelivered: true
-audit: {"sutra-audit-journal": "capture=media;sink=sql", "sutra-audit-deployment": "dep-8ef8bcdca12f51cc8c078bf1", "sutra-audit-instance": "fbbf6c70-3d45-4395-aaaa-38d5add0e952"}
-sha256: "829bf816c534c718a1e310b561220d4747d1257242baec7cbb414beebdfd673f"
-bytes: 368990
+audit: {"sutra-audit-journal": "capture=media;sink=sql", "sutra-audit-deployment": "dep-8ef8bcdca12f51cc8c078bf1", "sutra-audit-instance": "e23d9e93-f1d2-4431-ab01-ac20b28e2b5c"}
+sha256: "ac3d2789346ac5737beec078a2648d969cf7d523998167e9cdb4719d4192f199"
+bytes: 369198
 SUTRA-SEALED-STREAM-1
-829bf816c534c718a1e310b561220d4747d1257242baec7cbb414beebdfd673f  -
+
+ac3d2789346ac5737beec078a2648d969cf7d523998167e9cdb4719d4192f199  -
 ```
 
 A 360 KiB recording fits in one part (`nextPart: 2`). `audit` is the routing of the instance that
@@ -273,7 +274,7 @@ db "select event_type, node_id, payload_json from audit_event where payload_json
 ```
 
 ```text
-NODE_ENTERED|End|{"media":[{"bytes":368990,"callId":"meeting-M-1","channels":1,"complete":true,"consentAnnounced":true,"consentAnnouncedAtMs":-1581,"durationMs":22995,"encryption":{"cipher":"aes-256-gcm","keyId":"recordings","scheme":"sutra-sealed-stream-1"},"format":"audio/wav","kind":"media","rate":8000,"sha256":"829bf816c534c718a1e310b561220d4747d1257242baec7cbb414beebdfd673f","startMs":2617,"truncated":false,"uri":"s3://meeting-recordings/calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed"}]}
+NODE_ENTERED|End|{"media":[{"bytes":369198,"callId":"meeting-M-1","channels":1,"complete":true,"consentAnnounced":true,"consentAnnouncedAtMs":-1582,"durationMs":23006,"encryption":{"cipher":"aes-256-gcm","keyId":"recordings","scheme":"sutra-sealed-stream-1"},"format":"audio/wav","kind":"media","rate":8000,"sha256":"ac3d2789346ac5737beec078a2648d969cf7d523998167e9cdb4719d4192f199","startMs":2612,"truncated":false,"uri":"s3://meeting-recordings/calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed"}]}
 ```
 
 **7. Clean up:**

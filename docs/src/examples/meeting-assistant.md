@@ -48,7 +48,7 @@ echo "the engine is on port $PORT"
 
 ```text
 packaged examples/meeting-assistant/deploy/deployments/meeting-stub.sutra (deploymentId dep-8ef8bcdca12f51cc8c078bf1)
-the engine is on port 32999
+the engine is on port 33004
 ```
 
 **2. Ask the bot to join.** The request asks for the internal participant to be analysed too
@@ -109,7 +109,7 @@ analyzedRoles: ['external']
 speaker: Alex Chen internal analyzed=False sentiment=None emotion=None
 speaker: Sam Rivera external analyzed=True sentiment=positive emotion=engaged
 keywords: ['action item']
-recording: s3://meeting-recordings/calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed b5c6096f88b0bddc5644d30ae98798d6173f69ae2e49ab1d44550dabb69c7127
+recording: s3://meeting-recordings/calls/default/meeting-assistant/1.0.0/meeting-M-1.wav.sealed 79bfa05fb576c7efba5ccee37d935ba1e429387d0d029449e066dabed4484943
 ```
 
 The decision table (`rules/analysis-policy.dmn`) said no for the internal role, because the
