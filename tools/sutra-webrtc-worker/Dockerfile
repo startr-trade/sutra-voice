@@ -12,9 +12,10 @@
 # headers are needed at build time only; the X11 / DRM / VA-API libraries libwebrtc can use are
 # loaded lazily and only for screen capture and hardware codecs, which the worker never uses.
 #
-# libwebrtc (156 MB) is fetched once, checked against its SHA-256, and handed to the build with
-# LK_CUSTOM_WEBRTC, so the build never downloads it again; cargo's registry and target directory
-# are BuildKit cache mounts.
+# libwebrtc (156 MB for amd64, 172 MB for arm64) is fetched once, checked against its SHA-256,
+# and handed to the build with LK_CUSTOM_WEBRTC, so the build never downloads it again; cargo's
+# registry and target directory are BuildKit cache mounts. The image builds for linux/amd64 and
+# linux/arm64; the release builds each natively on a runner of that architecture.
 
 ARG RUST_IMAGE=rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
 # The engine's own runtime base: the binaries link only libc, libm and libgcc_s, which is what
@@ -32,14 +33,24 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends clang-${LLVM_VERSION} lld-${LLVM_VERSION} \
  && rm -rf /var/lib/apt/lists/* \
  && rustup component add rustfmt clippy
-# The prebuilt libwebrtc this SDK release expects (webrtc-sys-build WEBRTC_TAG = webrtc-a545de4).
-ADD --checksum=sha256:2ece73b9a72a2cacd73d0c62ac3a414e202f37885c3c8f49dddb43c1443ac0bd \
-    https://github.com/livekit/rust-sdks/releases/download/webrtc-a545de4/webrtc-linux-x64-release.zip \
-    /tmp/webrtc.zip
-RUN mkdir -p /opt/webrtc && unzip -q /tmp/webrtc.zip -d /opt/webrtc && rm /tmp/webrtc.zip
+# The prebuilt libwebrtc this SDK release expects (webrtc-sys-build WEBRTC_TAG = webrtc-a545de4),
+# for the architecture this stage runs on — the build is native, never a cross-compile, so the
+# toolchain image's own Debian architecture names it. Each archive is checked against its SHA-256.
+ARG WEBRTC_RELEASE=https://github.com/livekit/rust-sdks/releases/download/webrtc-a545de4
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) arch=x64;   sum=2ece73b9a72a2cacd73d0c62ac3a414e202f37885c3c8f49dddb43c1443ac0bd ;; \
+      arm64) arch=arm64; sum=e87dff71422c5cb1470f6cf00ecc4ad6964e746c5039831b7206b946b5d13c5f ;; \
+      *) echo "no prebuilt libwebrtc for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/webrtc.zip "${WEBRTC_RELEASE}/webrtc-linux-${arch}-release.zip"; \
+    echo "${sum}  /tmp/webrtc.zip" | sha256sum -c -; \
+    mkdir -p /opt/webrtc; unzip -q /tmp/webrtc.zip -d /opt/webrtc; rm /tmp/webrtc.zip; \
+    ln -s "/opt/webrtc/linux-${arch}-release" /opt/webrtc/current; \
+    test -d /opt/webrtc/current/include
 ENV CC=clang-${LLVM_VERSION} \
     CXX=clang++-${LLVM_VERSION} \
-    LK_CUSTOM_WEBRTC=/opt/webrtc/linux-x64-release \
+    LK_CUSTOM_WEBRTC=/opt/webrtc/current \
     CARGO_TERM_COLOR=never
 WORKDIR /src
 
