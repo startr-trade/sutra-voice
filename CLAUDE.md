@@ -79,7 +79,11 @@ trees get different package ids, so only third-party artifacts are shared).
 
 | Question | Page |
 |---|---|
-| The `voip` transport: channels, media protocol, gateways, `SUTRA_VOIP_*` | [`docs/voip-transport.md`](docs/voip-transport.md) |
-| The WebRTC worker and meeting sessions | [`docs/webrtc-worker.md`](docs/webrtc-worker.md) |
+| The `voip` transport: channels, media protocol, gateways, `SUTRA_VOIP_*` | [`docs/src/guides/voip-transport.md`](docs/src/guides/voip-transport.md) |
+| The WebRTC worker and meeting sessions | [`docs/src/guides/webrtc-worker.md`](docs/src/guides/webrtc-worker.md) |
 | Each example's flow, data and run commands | `examples/<name>/README.md` |
 | BPMN, channels, `llm` channels, packaging | the engine book, `https://sutra.startr.trade/` |
+
+## The book
+
+`docs/` is an mdBook (`docs/book.toml`, pages in `docs/src/`, deployed to voice.sutra.startr.trade). Diagrams are ```` ```mermaid ```` fences drawn in the browser by the committed Pele build (`docs/pele.global.js`, verified by `scripts/docs-pele.sh --check`; there is no npm here). Build with `mdbook build docs -d /tmp/sutra-voice-book`, never into the repo. Like the rest of the tree it must stand alone: no references to documents that are not in this repository.

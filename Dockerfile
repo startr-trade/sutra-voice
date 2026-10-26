@@ -13,7 +13,7 @@
 #
 # Run it exactly like the engine image — the same `SUTRA_*` environment (SUTRA_DEPLOYMENTS_DIR,
 # SUTRA_HTTP_PORT, SUTRA_DATASOURCE_*), plus the `SUTRA_VOIP_*` settings of the voip transport
-# (docs/voip-transport.md).
+# (docs/src/guides/voip-transport.md).
 
 # ---- chef (shared toolchain layer) -------------------------------------------
 # The bookworm variant, so the builder's glibc matches the runtime image below. make + g++ are

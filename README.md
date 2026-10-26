@@ -1,4 +1,9 @@
-# sutra-voice
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/sutra-voice-lockup-dark.svg">
+    <img src="assets/brand/sutra-voice-lockup-light.svg" alt="Sutra Voice" width="540">
+  </picture>
+</p>
 
 Phone calls, IVRs and meetings for the [Sutra](https://github.com/startr-trade/sutra) workflow
 engine. A BPMN flow answers a number, hears the caller one utterance at a time, speaks back,
@@ -24,7 +29,7 @@ Voice, meeting and video support is a **preview** in 0.6.0.
 | `examples/meeting-assistant` | Joins a conference by its SIP dial-in, records and transcribes it, writes the minutes. |
 | `examples/video-meeting-assistant` | The same for a LiveKit video meeting, through the WebRTC worker, with per-participant segment analysis. |
 | `examples/model-stub` | The stub model server the examples and tests use — no key, no network. |
-| `docs/` | The user guides: [the `voip` transport](docs/voip-transport.md) and [the WebRTC worker](docs/webrtc-worker.md). |
+| `docs/` | The mdBook, published at [voice.sutra.startr.trade](https://voice.sutra.startr.trade): introduction, quick start, architecture, guides ([the `voip` transport](docs/src/guides/voip-transport.md), [the WebRTC worker](docs/src/guides/webrtc-worker.md)), operations and roadmap. `mdbook build docs -d /tmp/sutra-voice-book` builds it; `scripts/docs-pele.sh --check` verifies the pinned diagram renderer. |
 | `engine/` | The engine, as a git submodule (the public Sutra repository). |
 
 Everything about BPMN itself — elements, wait states, channels, `llm` channels, packaging — is
@@ -45,7 +50,7 @@ make worker-image     # sutra-webrtc-worker:dev (in Docker; first build fetches 
 
 The image runs exactly like the engine's (`SUTRA_DEPLOYMENTS_DIR`, `SUTRA_HTTP_PORT`,
 `SUTRA_DATASOURCE_*`), plus the transport's `SUTRA_VOIP_*` settings described in
-[docs/voip-transport.md](docs/voip-transport.md). Package an example with the engine's `sutra`
+[the voip transport guide](docs/src/guides/voip-transport.md). Package an example with the engine's `sutra`
 CLI ([installation](https://sutra.startr.trade/getting-started/installation.html)); each example's
 README has the exact commands and a local compose stack.
 

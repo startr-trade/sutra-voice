@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" role="img" aria-label="Sutra Voice — voice, video and meetings as governed BPMN processes">
+  <!-- GitHub social-preview card (render to PNG at 1280x640 before uploading). -->
+  <rect width="1280" height="640" fill="#0F1117"/>
+  <g transform="translate(110,110) scale(1.75)">
+    <path d="M148 42 C 70 42 62 104 100 120 C 138 136 130 198 62 198" fill="none" stroke="#AEB6E8" stroke-width="7" stroke-linecap="round"/>
+    <path d="M172 26 A 26 26 0 0 1 172 58" fill="none" stroke="#F49D1A" stroke-width="5" stroke-linecap="round"/>
+    <path d="M184 14 A 42 42 0 0 1 184 70" fill="none" stroke="#F49D1A" stroke-width="5" stroke-linecap="round" opacity="0.75"/>
+    <path d="M196 4 A 58 58 0 0 1 196 80" fill="none" stroke="#F49D1A" stroke-width="5" stroke-linecap="round" opacity="0.5"/>
+    <circle cx="148" cy="42" r="15" fill="#0F1117" stroke="#AEB6E8" stroke-width="4"/>
+    <path d="M100 98 L122 120 L100 142 L78 120 Z" fill="#0F1117" stroke="#F49D1A" stroke-width="5"/>
+    <path d="M66 188 L44 198 L66 208 Z" fill="#AEB6E8"/>
+  </g>
+  <path d="M566.0 190.0 L567.6 189.9 L569.2 189.4 L570.9 188.7 L572.5 187.7 L574.1 186.6 L575.7 185.7 L577.3 185.0 L578.9 184.7 L580.5 185.1 L582.2 186.0 L583.8 187.7 L585.4 190.0 L587.0 192.8 L588.6 195.8 L590.2 198.9 L591.9 201.8 L593.5 204.1 L595.1 205.5 L596.7 205.9 L598.3 205.1 L600.0 203.0 L601.6 199.6 L603.2 195.2 L604.8 190.0 L606.4 184.3 L608.0 178.5 L609.6 173.2 L611.3 168.6 L612.9 165.3 L614.5 163.6 L616.1 163.7 L617.7 165.7 L619.4 169.6 L621.0 175.2 L622.6 182.2 L624.2 190.0 L625.8 198.2 L627.4 206.2 L629.0 213.4 L630.7 219.1 L632.3 223.1 L633.9 224.8 L635.5 224.2 L637.1 221.1 L638.8 215.7 L640.4 208.4 L642.0 199.6 L643.6 190.0 L645.2 180.2 L646.8 170.8 L648.5 162.7 L650.1 156.3 L651.7 152.1 L653.3 150.6 L654.9 151.8 L656.5 155.6 L658.1 161.8 L659.8 170.0 L661.4 179.7 L663.0 190.0 L664.6 200.3 L666.2 210.0 L667.9 218.2 L669.5 224.4 L671.1 228.2 L672.7 229.4 L674.3 227.9 L675.9 223.7 L677.5 217.3 L679.2 209.2 L680.8 199.8 L682.4 190.0 L684.0 180.4 L685.6 171.6 L687.2 164.3 L688.9 158.9 L690.5 155.8 L692.1 155.2 L693.7 156.9 L695.3 160.9 L697.0 166.6 L698.6 173.8 L700.2 181.8 L701.8 190.0 L703.4 197.8 L705.0 204.8 L706.6 210.4 L708.3 214.3 L709.9 216.3 L711.5 216.4 L713.1 214.7 L714.7 211.4 L716.4 206.8 L718.0 201.5 L719.6 195.7 L721.2 190.0 L722.8 184.8 L724.4 180.4 L726.0 177.0 L727.7 174.9 L729.3 174.1 L730.9 174.5 L732.5 175.9 L734.1 178.2 L735.8 181.1 L737.4 184.2 L739.0 187.2 L740.6 190.0 L742.2 192.3 L743.8 194.0 L745.5 194.9 L747.1 195.3 L748.7 195.0 L750.3 194.3 L751.9 193.4 L753.5 192.3 L755.1 191.3 L756.8 190.6 L758.4 190.1 L760.0 190.0" fill="none" stroke="#AEB6E8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M760 190 H1120" fill="none" stroke="#AEB6E8" stroke-width="6" stroke-linecap="round"/>
+  <path d="M1120 180 L1144 190 L1120 200 Z" fill="#F49D1A"/>
+  <text x="570" y="330" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif" font-size="108" font-weight="700" letter-spacing="2" fill="#EDEFF9">sutra<tspan fill="#F49D1A" font-weight="600"> voice</tspan></text>
+  <text x="576" y="392" font-family="'Noto Sans Devanagari','Noto Sans',sans-serif" font-size="34" fill="#7C82A0">सूत्रा · वाणी</text>
+  <text x="570" y="470" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif" font-size="32" fill="#C9CDE4">Calls, IVR and meetings as governed</text>
+  <text x="570" y="514" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif" font-size="32" fill="#C9CDE4">BPMN processes — for the Sutra engine</text>
+  <text x="570" y="586" font-family="'Noto Sans','Segoe UI',ui-sans-serif,sans-serif" font-size="30" letter-spacing="1" fill="#E8871E">github.com/startr-trade/sutra-voice</text>
+</svg>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Sutra Voice">
+  <!-- Favicon cut: the heavy S plus one saffron sound arc at its head. Theme-aware. -->
+  <style>
+    .thread { stroke: #26317E; }
+    .ring   { stroke: #26317E; fill: #FFFFFF; }
+    @media (prefers-color-scheme: dark) {
+      .thread { stroke: #AEB6E8; }
+      .ring   { stroke: #AEB6E8; fill: #0F1117; }
+    }
+  </style>
+  <path class="thread" d="M84 26 C 40 26 36 60 58 66 C 80 72 76 102 34 102" fill="none" stroke-width="12" stroke-linecap="round"/>
+  <path d="M104 12 A 20 20 0 0 1 104 40" fill="none" stroke="#E8871E" stroke-width="8" stroke-linecap="round"/>
+  <circle class="ring" cx="84" cy="26" r="13" stroke-width="6"/>
+  <circle cx="34" cy="102" r="11" fill="#E8871E"/>
+</svg>

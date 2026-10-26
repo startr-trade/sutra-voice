@@ -1,0 +1,25 @@
+[book]
+title = "Sutra Voice"
+description = "Calls, IVR and meetings as governed BPMN processes on the Sutra engine"
+authors = ["Startr Trading Technologies Private Limited"]
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/"
+default-theme = "light"
+preferred-dark-theme = "coal"
+git-repository-url = "https://github.com/startr-trade/sutra-voice"
+edit-url-template = "https://github.com/startr-trade/sutra-voice/edit/main/docs/{path}"
+# ```mermaid blocks are drawn by Pele in the reader's browser: pele.global.js is the pinned build
+# (scripts/docs-pele.sh --check), pele-init.js draws each block, pele-theme.css colours them from the
+# current theme, diagrams.css fits them to the column, diagram-open.js opens one full size on click.
+additional-css = ["diagrams.css", "pele-theme.css", "brand.css"]
+additional-js = ["pele.global.js", "pele-init.js", "diagram-open.js"]
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

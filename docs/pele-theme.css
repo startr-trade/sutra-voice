@@ -1,0 +1,25 @@
+/* Pele's colours from the Sutra palette, following the book's theme.
+ * mdBook themes: light, rust (light family); coal, navy, ayu (dark family).
+ * Light: ink #26317E, accent #E8871E, white. Dark: ink #AEB6E8, accent #F49D1A, #0F1117. */
+.diagram {
+    --pele-bg: #FFFFFF;
+    --pele-fg: #26317E;
+    --pele-muted: #5B6499;
+    --pele-line: #26317E;
+    --pele-surface: #F1F3FA;
+    --pele-surface-alt: #E4E8F5;
+    --pele-border: #B9C0E0;
+    --pele-accent: #E8871E;
+    --pele-font: "Open Sans", "Segoe UI", system-ui, sans-serif;
+    --pele-font-mono: var(--mono-font, monospace);
+}
+html.coal .diagram, html.navy .diagram, html.ayu .diagram {
+    --pele-bg: #0F1117;
+    --pele-fg: #AEB6E8;
+    --pele-muted: #8A93C6;
+    --pele-line: #AEB6E8;
+    --pele-surface: #1A1E2B;
+    --pele-surface-alt: #232838;
+    --pele-border: #3A4163;
+    --pele-accent: #F49D1A;
+}
