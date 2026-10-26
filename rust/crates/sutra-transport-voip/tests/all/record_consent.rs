@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use futures_util::SinkExt;
+use sutra_objectstore::{MemoryObjectStore, ObjectStore, StoreLocation};
 use sutra_transport_voip::audio::{pcm16_to_le, wav_wrap};
 use sutra_transport_voip::config::route_set_of;
 use sutra_transport_voip::gateway::{GatewayControl, GenericGateway};
 use sutra_transport_voip::hub::{OpError, VoipHub};
 use sutra_transport_voip::media::media_router;
 use sutra_transport_voip::recording::{open_stream, Recorder};
-use sutra_transport_voip::store::{MemoryRecordingStore, RecordingStore, StoreLocation};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::support::*;
@@ -27,17 +27,16 @@ struct Rig {
     hub: Arc<VoipHub>,
     addr: std::net::SocketAddr,
     rx: tokio::sync::mpsc::UnboundedReceiver<sutra_channels::InboundMessage>,
-    store: MemoryRecordingStore,
+    store: MemoryObjectStore,
 }
 
 async fn rig(channels: &str) -> Rig {
     let (intake, rx) = FakeIntake::new();
     let routes = route_set_of(&definitions(channels, "billing")).unwrap();
-    let store =
-        MemoryRecordingStore::new(StoreLocation::parse("memory://recordings/calls").unwrap());
+    let store = MemoryObjectStore::new(StoreLocation::parse("memory://recordings/calls").unwrap());
     let recorder = Arc::new(
         Recorder::new(
-            Arc::new(store.clone()) as Arc<dyn RecordingStore>,
+            Arc::new(store.clone()) as Arc<dyn ObjectStore>,
             Some(KEK),
             "rec-key",
             600,
@@ -174,10 +173,7 @@ async fn record_start_waits_for_consent_and_record_stop_answers_the_reference() 
     assert!(first["durationMs"].as_u64().unwrap() >= 500, "{first}");
     let key = "acme/billing/1.0.0/r1.wav.sealed";
     let object = rig.store.get(key).await.unwrap().expect("stored");
-    assert_eq!(
-        first["sha256"],
-        sutra_transport_voip::store::sha256_hex(&object)
-    );
+    assert_eq!(first["sha256"], sutra_objectstore::sha256_hex(&object));
     let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
     assert!(
         open_stream(&kek, &format!("calls/{key}"), &object)

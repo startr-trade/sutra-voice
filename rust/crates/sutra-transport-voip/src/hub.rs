@@ -22,7 +22,7 @@ use crate::config::{CallSettings, EventKind, ModuleRoute, RouteSet, TurnBody, Vo
 use crate::features::{analyze_turn, CallAnalytics, PitchConfig};
 use crate::gateway::{GatewayControl, GatewayError, GatewayEvent, OriginateRequest};
 use crate::listen::{self, ListenState, SpeakerTrack};
-use crate::meeting::{self, AnalysisPolicy, AnalysisSettings, AnalysisTiming, MeetingState};
+use crate::meeting::{self, MeetingState, SegmentSettings};
 use crate::pacing::{frames_of, pace, PlaybackOutcome};
 use crate::policy::{OriginateGuard, Refusal};
 use crate::protocol::{self, Framing};
@@ -55,12 +55,12 @@ pub mod headers {
     pub const SEGMENT_SEQ: &str = "x-segment-seq";
     /// On `call-keyword`: the phrase heard.
     pub const KEYWORD: &str = "x-keyword";
-    /// On `call-participant` / `call-analysis` / a meeting's `call-transcript`: the participant.
+    /// On `call-participant` / `call-segment` / a meeting's `call-transcript`: the participant.
     pub const PARTICIPANT_ID: &str = "x-participant-id";
     /// On `call-participant`: `joined` or `left`.
     pub const PARTICIPANT_EVENT: &str = "x-participant-event";
-    /// On `call-analysis`: the segment's number (from 1).
-    pub const ANALYSIS_SEGMENT: &str = "x-analysis-segment";
+    /// On `call-segment`: the segment's number (from 1).
+    pub const SEGMENT: &str = "x-segment";
 }
 
 /// What a media socket's opening frame said beyond the call id and format.
@@ -72,18 +72,17 @@ pub struct MediaOptions {
     pub headers: BTreeMap<String, String>,
 }
 
-/// What a meeting session's analysis produced so far (periodic runs and the final one).
+/// What a meeting session's segments came to so far.
 #[derive(Debug, Default)]
-struct AnalysisTally {
-    segments: u64,
-    results: u64,
+struct SegmentTally {
+    /// `call-segment` messages delivered (one per participant and segment).
+    delivered: u64,
+    /// Segments whose media could not be written (delivered with `status: "failed"`).
     failed: u64,
-    unavailable: Option<String>,
-    /// The candidate of the analysis channel that gave the latest answer.
-    provider: Option<String>,
-    model: Option<String>,
-    /// Per participant index: segments, emotion and engagement counts, disagreements.
-    digest: BTreeMap<u16, Value>,
+    /// Segments not cut: the session waited for consent.
+    skipped: u64,
+    /// Per participant index: segments delivered.
+    per_participant: BTreeMap<u16, u64>,
 }
 
 /// What an originate's `mode` asks for.
@@ -192,9 +191,13 @@ pub struct Call {
     meeting: Mutex<Option<MeetingState>>,
     /// The call's transcript segments so far (they number from 1, across participants).
     segment_seq: AtomicU64,
-    /// Held while a meeting segment analysis runs (periodic and final runs never overlap).
-    analysis_lock: tokio::sync::Mutex<()>,
-    analysis_tally: Mutex<AnalysisTally>,
+    /// Held while a meeting's segments are cut and written (periodic and final runs never
+    /// overlap).
+    segment_lock: tokio::sync::Mutex<()>,
+    segment_tally: Mutex<SegmentTally>,
+    /// The audit routing of the instance that owns the call, from the first request that
+    /// carried it (the originate, or any later operation on the call).
+    audit: Mutex<Option<sutra_channels::TransportAuditContext>>,
     created: Instant,
     closed: watch::Sender<bool>,
 }
@@ -285,12 +288,10 @@ pub struct VoipHub {
     bridge_tokens: Option<BridgeTokens>,
     /// The toll-fraud controls on `originate`.
     originate_guard: OriginateGuard,
+    /// Where this transport's audit events go.
+    audit: crate::audit::AuditJournal,
     this: Weak<VoipHub>,
 }
-
-/// How far behind the session clock a periodic analysis stays (transcript segments arrive a
-/// little after their audio).
-pub const PERIODIC_ANALYSIS_LAG_MS: u64 = 2000;
 
 /// How many ended call ids the hub remembers.
 pub const ENDED_MEMORY: usize = 4096;
@@ -372,6 +373,23 @@ impl VoipHub {
         gateway: Arc<dyn GatewayControl>,
         recorder: Option<Arc<Recorder>>,
     ) -> Arc<VoipHub> {
+        let audit = recorder
+            .as_ref()
+            .map(|r| r.audit().clone())
+            .unwrap_or_else(crate::audit::AuditJournal::process_wide);
+        VoipHub::with_parts(config, intake, routes, gateway, recorder, audit)
+    }
+
+    /// [`Self::with_recorder`] writing audit events to `audit` (tests inject a registry of
+    /// their own; the engine's is [`crate::audit::AuditJournal::process_wide`]).
+    pub fn with_parts(
+        config: VoipConfig,
+        intake: Arc<dyn InboundIntake>,
+        routes: RouteSet,
+        gateway: Arc<dyn GatewayControl>,
+        recorder: Option<Arc<Recorder>>,
+        audit: crate::audit::AuditJournal,
+    ) -> Arc<VoipHub> {
         let bridge_tokens = config
             .media_token
             .as_deref()
@@ -388,6 +406,7 @@ impl VoipHub {
             awaiting_media: Mutex::new(VecDeque::new()),
             ended: Mutex::new(VecDeque::new()),
             recorder,
+            audit,
             this: this.clone(),
         })
     }
@@ -395,6 +414,39 @@ impl VoipHub {
     /// The recordings sink, when one is configured.
     pub fn recorder(&self) -> Option<&Arc<Recorder>> {
         self.recorder.as_ref()
+    }
+
+    /// Where this transport's audit events go.
+    pub fn audit(&self) -> &crate::audit::AuditJournal {
+        &self.audit
+    }
+
+    /// Keep the audit routing a request on `call` carries (the first one wins: one call belongs
+    /// to one instance), and hand it to the call's recordings in progress.
+    fn note_audit_context(&self, call: &Call, message: &OutboundMessage) {
+        let Some(context) = crate::audit::context_of(&message.headers) else {
+            return;
+        };
+        {
+            let mut known = lock(&call.audit);
+            if known.is_some() {
+                return;
+            }
+            *known = Some(context.clone());
+        }
+        if let Some(writer) = lock(&call.listen)
+            .as_ref()
+            .and_then(|s| s.recording.as_ref())
+        {
+            writer.set_audit_context(&context);
+        }
+        if let Some(state) = lock(&call.meeting).as_ref() {
+            for participant in state.participants.values() {
+                if let Some(writer) = participant.audio.recording.as_ref() {
+                    writer.set_audit_context(&context);
+                }
+            }
+        }
     }
 
     /// Spawn the task feeding gateway events into the hub.
@@ -520,8 +572,9 @@ impl VoipHub {
             listen: Mutex::new(None),
             meeting: Mutex::new(None),
             segment_seq: AtomicU64::new(0),
-            analysis_lock: tokio::sync::Mutex::new(()),
-            analysis_tally: Mutex::new(AnalysisTally::default()),
+            segment_lock: tokio::sync::Mutex::new(()),
+            segment_tally: Mutex::new(SegmentTally::default()),
+            audit: Mutex::new(None),
             created: Instant::now(),
             closed,
         });
@@ -711,6 +764,7 @@ impl VoipHub {
             module_key: module_key.clone(),
             participant_id: None,
             participant_index: None,
+            audit: lock(&call.audit).clone(),
         };
         (module_key, owner)
     }
@@ -862,14 +916,21 @@ impl VoipHub {
                 let mut guard = lock(&call.meeting);
                 guard
                     .as_mut()
-                    .and_then(|state| state.participants.get_mut(&track.index))
-                    .map(|participant| {
-                        participant.lines.push(meeting::TranscriptLine {
-                            start_ms: start,
-                            end_ms: end,
-                            text: text.to_string(),
-                        });
-                        listen::segment_features(&participant.audio, start_ms, end_ms)
+                    .map(|state| {
+                        let features = state
+                            .participants
+                            .get(&track.index)
+                            .map(|p| listen::segment_features(&p.audio, start_ms, end_ms))
+                            .unwrap_or(Value::Null);
+                        state.add_line(
+                            track.index,
+                            meeting::TranscriptLine {
+                                start_ms: start,
+                                end_ms: end,
+                                text: text.to_string(),
+                            },
+                        );
+                        features
                     })
                     .unwrap_or(Value::Null)
             }
@@ -936,40 +997,34 @@ impl VoipHub {
 
     // ---- meeting sessions -------------------------------------------------------------------
 
-    /// A meeting session's media is up: start the periodic analysis when the deployment asks
-    /// for it.
+    /// A meeting session's media is up: every second, cut the segments that have closed (a
+    /// `call-segment` channel), write their media and deliver their references, and let go of
+    /// what no segment needs any more — so a participant's memory stays bounded however long
+    /// the meeting runs.
     fn start_meeting(&self, call: &Arc<Call>) {
-        let analysis = lock(&call.meta)
-            .module
-            .as_ref()
-            .and_then(|m| m.analysis.clone());
-        if let Some(settings) = analysis.filter(|a| a.timing == AnalysisTiming::Periodic) {
-            let hub = self.this.clone();
-            let weak = Arc::downgrade(call);
-            tokio::spawn(async move {
-                let tick = std::time::Duration::from_millis(settings.segment_ms.max(1000));
-                loop {
-                    tokio::time::sleep(tick).await;
-                    let (Some(hub), Some(call)) = (hub.upgrade(), weak.upgrade()) else {
-                        return;
-                    };
-                    if call.is_ended() {
-                        return;
-                    }
-                    let _running = call.analysis_lock.lock().await;
-                    let inputs = {
-                        let mut guard = lock(&call.meeting);
-                        let Some(state) = guard.as_mut() else { return };
-                        // Transcript segments arrive a little after their audio.
-                        let upto = state.elapsed_ms().saturating_sub(PERIODIC_ANALYSIS_LAG_MS);
-                        let inputs = state.take_segments(&settings, upto, false);
-                        state.release_frames_before(state.next_segment * settings.segment_ms);
-                        inputs
-                    };
-                    hub.run_analysis(&call, &settings, inputs).await;
+        let hub = self.this.clone();
+        let weak = Arc::downgrade(call);
+        tokio::spawn(async move {
+            let tick = std::time::Duration::from_millis(meeting::SEGMENT_TICK_MS);
+            loop {
+                tokio::time::sleep(tick).await;
+                let (Some(hub), Some(call)) = (hub.upgrade(), weak.upgrade()) else {
+                    return;
+                };
+                if call.is_ended() {
+                    return;
                 }
-            });
-        }
+                let _running = call.segment_lock.lock().await;
+                let taken = {
+                    let mut guard = lock(&call.meeting);
+                    let Some(state) = guard.as_mut() else { return };
+                    // Transcript lines arrive a little after their audio.
+                    let upto = state.elapsed_ms().saturating_sub(meeting::SEGMENT_LAG_MS);
+                    state.take_segments(upto, false)
+                };
+                hub.deliver_segments(&call, taken).await;
+            }
+        });
     }
 
     /// The `policy` frame a meeting session's gateway is sent once the session is accepted.
@@ -995,12 +1050,11 @@ impl VoipHub {
             let meta = lock(&call.meta);
             (meta.module.clone(), meta.settings.vad)
         };
-        let analysis = module.as_ref().and_then(|m| m.analysis.clone());
         let (body, track, rate) = {
             let mut guard = lock(&call.meeting);
             let Some(state) = guard.as_mut() else { return };
             let rate = state.rate;
-            let Some(participant) = state.join(joined, analysis.as_ref(), &vad) else {
+            let Some(participant) = state.join(joined, &vad) else {
                 return;
             };
             let track = SpeakerTrack {
@@ -1017,8 +1071,7 @@ impl VoipHub {
                 "label": participant.label,
                 "role": participant.role,
                 "declaredRole": participant.declared_role,
-                "analysed": participant.policy == AnalysisPolicy::Analysed,
-                "analysisPolicy": participant.policy.as_str(),
+                "segmented": participant.segmented,
                 "atMs": participant.joined_at_ms,
             });
             (body, track, rate)
@@ -1144,13 +1197,13 @@ impl VoipHub {
         }
     }
 
-    /// Analyse `inputs` one by one, delivering each answer on `call-analysis`.
-    async fn run_analysis(
-        &self,
-        call: &Arc<Call>,
-        settings: &AnalysisSettings,
-        inputs: Vec<meeting::SegmentInput>,
-    ) {
+    /// Write each segment's media to the recording store (the audio as a WAV file, each frame as
+    /// an image; sealed when recordings are) and deliver its references on `call-segment`, one
+    /// message per participant and segment. `taken` is what [`MeetingState::take_segments`]
+    /// answered.
+    async fn deliver_segments(&self, call: &Arc<Call>, taken: (Vec<meeting::SegmentInput>, u64)) {
+        let (inputs, skipped) = taken;
+        lock(&call.segment_tally).skipped += skipped;
         if inputs.is_empty() {
             return;
         }
@@ -1159,68 +1212,163 @@ impl VoipHub {
             .as_ref()
             .map(|m| m.module_key.clone())
             .unwrap_or_default();
-        let model = match meeting::analysis_model(settings, &module_key) {
-            Ok(model) => model,
-            Err(detail) => {
-                tracing::warn!(call_id = %call.call_id, channel = %settings.channel, "voip: segment analysis unavailable: {detail}");
-                let mut tally = lock(&call.analysis_tally);
-                tally.unavailable = Some(detail);
-                tally.failed += inputs.len() as u64;
-                return;
-            }
-        };
-        let mut segments = std::collections::BTreeSet::new();
-        for input in &inputs {
-            segments.insert(input.segment);
-            let body = meeting::analyse(&model, settings, &call.call_id, input).await;
+        for input in inputs {
+            let body = self.write_segment(call, &module_key, input).await;
             {
-                let mut tally = lock(&call.analysis_tally);
-                if body["status"] == "complete" {
-                    tally.results += 1;
-                    tally.provider = body["provider"].as_str().map(str::to_string);
-                    tally.model = body["model"].as_str().map(str::to_string);
-                    let digest = tally
-                        .digest
-                        .entry(input.index)
-                        .or_insert_with(|| json!({"segments": 0, "emotions": {}, "engagement": {}, "disagreements": 0}));
-                    digest["segments"] = json!(digest["segments"].as_u64().unwrap_or(0) + 1);
-                    let result = &body["result"];
-                    if let Some(label) = result["emotion"]["label"].as_str() {
-                        let label: String = label.chars().take(40).collect();
-                        let n = digest["emotions"][&label].as_u64().unwrap_or(0);
-                        digest["emotions"][label] = json!(n + 1);
-                    }
-                    if let Some(level) = result["engagement"].as_str() {
-                        let level: String = level.chars().take(20).collect();
-                        let n = digest["engagement"][&level].as_u64().unwrap_or(0);
-                        digest["engagement"][level] = json!(n + 1);
-                    }
-                    if result["disagreement"]["flagged"] == true {
-                        digest["disagreements"] =
-                            json!(digest["disagreements"].as_u64().unwrap_or(0) + 1);
-                    }
-                } else {
+                let mut tally = lock(&call.segment_tally);
+                tally.delivered += 1;
+                if body["status"] != "complete" {
                     tally.failed += 1;
                 }
+                let index = body["participantIndex"].as_u64().unwrap_or(0) as u16;
+                *tally.per_participant.entry(index).or_default() += 1;
             }
             let extra = BTreeMap::from([
                 (
                     headers::PARTICIPANT_ID.to_string(),
-                    input.participant_id.clone(),
+                    body["participantId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
                 ),
-                (
-                    headers::ANALYSIS_SEGMENT.to_string(),
-                    input.segment.to_string(),
-                ),
+                (headers::SEGMENT.to_string(), body["segment"].to_string()),
             ]);
-            self.enqueue_json(call, EventKind::CallAnalysis, extra, body);
+            self.enqueue_json(call, EventKind::CallSegment, extra, body);
         }
-        lock(&call.analysis_tally).segments += segments.len() as u64;
+    }
+
+    /// One participant's segment: its media written, and the `call-segment` body.
+    async fn write_segment(
+        &self,
+        call: &Call,
+        module_key: &str,
+        input: meeting::SegmentInput,
+    ) -> Value {
+        let participant = input.participant_id.clone();
+        let reference =
+            |stored: crate::recording::StoredMedia, format: &str, start: u64, end: u64| {
+                json!({
+                    "kind": listen::MEDIA_REFERENCE_KIND,
+                    "uri": stored.uri,
+                    "sha256": stored.sha256,
+                    "bytes": stored.bytes,
+                    "format": format,
+                    "participant": participant,
+                    "startMs": start,
+                    "endMs": end,
+                    "sealed": stored.sealed,
+                })
+            };
+        let audio_ms = input.samples.len() as u64 * 1000 / u64::from(input.rate.max(1));
+        let features = {
+            let (samples, rate, threshold) =
+                (input.samples.clone(), input.rate, input.energy_threshold);
+            tokio::task::spawn_blocking(move || {
+                meeting::acoustic_features(&samples, rate, threshold)
+            })
+            .await
+            .unwrap_or(Value::Null)
+        };
+        let mut body = json!({
+            "callId": call.call_id,
+            "key": format!("{}:{}:{}", call.call_id, input.index, input.segment),
+            "participantId": input.participant_id,
+            "participantIndex": input.index,
+            "participant": format!("P{}", input.index),
+            "label": input.label,
+            "role": input.role,
+            "declaredRole": input.declared_role,
+            "segment": input.segment,
+            "startMs": input.start_ms,
+            "endMs": input.end_ms,
+            "speaking": input.speaking,
+            "talkMs": input.talk_ms,
+            "audioMs": audio_ms,
+            "features": features,
+            "flaggedMoments": input.flags,
+            "words": input.words,
+            "present": input.present,
+            "audio": Value::Null,
+            "frames": [],
+            "status": "complete",
+        });
+        let Some(recorder) = self.recorder.as_ref() else {
+            body["status"] = json!("unavailable");
+            body["detail"] =
+                json!("no recording store is configured, so no segment media is written");
+            return body;
+        };
+        let name = |suffix: &str| {
+            [
+                call.call_id.clone(),
+                "segments".to_string(),
+                format!("p{}", input.index),
+                format!("{}{suffix}", input.segment),
+            ]
+        };
+        let mut errors = Vec::new();
+        if !input.samples.is_empty() {
+            let wav = audio::wav_wrap(&input.samples, input.rate);
+            let names = name("");
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            match recorder
+                .put_media(
+                    module_key,
+                    &names,
+                    "wav",
+                    crate::recording::RECORDING_FORMAT,
+                    wav,
+                )
+                .await
+            {
+                Ok(stored) => {
+                    let mut audio_ref = reference(
+                        stored,
+                        crate::recording::RECORDING_FORMAT,
+                        input.start_ms,
+                        input.end_ms,
+                    );
+                    audio_ref["rate"] = json!(input.rate);
+                    audio_ref["durationMs"] = json!(audio_ms);
+                    body["audio"] = audio_ref;
+                }
+                Err(e) => errors.push(format!("audio: {e}")),
+            }
+        }
+        let format = lock(&call.meeting)
+            .as_ref()
+            .map(|s| s.video.format.clone())
+            .unwrap_or_else(|| meeting::DEFAULT_FRAME_FORMAT.to_string());
+        let extension = if format == "image/png" { "png" } else { "jpg" };
+        let mut frames = Vec::new();
+        for (k, frame) in input.frames.into_iter().enumerate() {
+            let names = name(&format!("-f{}", k + 1));
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            match recorder
+                .put_media(module_key, &names, extension, &format, frame.data)
+                .await
+            {
+                Ok(stored) => {
+                    let mut frame_ref = reference(stored, &format, frame.at_ms, frame.at_ms);
+                    frame_ref["atMs"] = json!(frame.at_ms.saturating_sub(input.start_ms));
+                    frame_ref["requested"] = json!(frame.requested);
+                    frames.push(frame_ref);
+                }
+                Err(e) => errors.push(format!("frame {}: {e}", k + 1)),
+            }
+        }
+        body["frames"] = json!(frames);
+        if !errors.is_empty() {
+            tracing::warn!(call_id = %call.call_id, segment = input.segment, index = input.index, "voip: segment media could not be written: {}", errors.join("; "));
+            body["status"] = json!("failed");
+            body["detail"] = json!(errors.join("; "));
+        }
+        body
     }
 
     /// Finish a meeting session after its end: stop every participant's tap, drain the
-    /// transcribers, analyse what is left, write each participant's recording, then deliver the
-    /// hang-up with all of it — so every transcript segment and analysis precedes it.
+    /// transcribers, write the last segment, write each participant's recording, then deliver the
+    /// hang-up with all of it — so every transcript segment and every segment precedes it.
     fn finish_meeting(
         &self,
         call: &Arc<Call>,
@@ -1263,17 +1411,18 @@ impl VoipHub {
                 transcripts.insert(index, summary);
             }
 
-            let analysis = module.as_ref().and_then(|m| m.analysis.clone());
-            if let Some(settings) = &analysis {
-                let _running = call.analysis_lock.lock().await;
-                let inputs = state.take_segments(settings, end_ms, true);
-                state.release_frames_before(u64::MAX);
-                hub.run_analysis(&call, settings, inputs).await;
+            // The last segment (partial), written and delivered before the hang-up.
+            let segments: Option<SegmentSettings> = state.segments.clone();
+            if segments.is_some() {
+                let _running = call.segment_lock.lock().await;
+                let taken = state.take_segments(end_ms, true);
+                hub.deliver_segments(&call, taken).await;
             }
+            state.release_before(u64::MAX);
 
             let mut recordings = Vec::new();
             let mut participants = Vec::new();
-            let tally = std::mem::take(&mut *lock(&call.analysis_tally));
+            let tally = std::mem::take(&mut *lock(&call.segment_tally));
             let consent_at = state.consent_at_ms;
             for participant in state.participants.values_mut() {
                 let recording = if !state.record {
@@ -1314,13 +1463,13 @@ impl VoipHub {
                     "label": participant.label,
                     "role": participant.role,
                     "declaredRole": participant.declared_role,
-                    "analysed": participant.policy == AnalysisPolicy::Analysed,
-                    "analysisPolicy": participant.policy.as_str(),
+                    "segmented": participant.segmented,
+                    "segments": tally.per_participant.get(&participant.index).copied().unwrap_or(0),
                     "joinedAtMs": participant.joined_at_ms,
                     "leftAtMs": participant.left_at_ms,
                     "leftReason": participant.left_reason,
                     "talkMs": participant.speech.voiced_ms,
-                    "transcriptLines": participant.lines.len(),
+                    "transcriptLines": participant.line_count,
                     "transcript": transcripts.remove(&participant.index).unwrap_or(Value::Null),
                     "video": {
                         "regular": participant.frames_regular,
@@ -1329,7 +1478,6 @@ impl VoipHub {
                     },
                     "tracks": participant.tracks,
                     "recording": recording,
-                    "analysis": tally.digest.get(&participant.index).cloned().map(with_dominants).unwrap_or(Value::Null),
                 }));
             }
             body["mode"] = json!(MODE_LISTEN);
@@ -1343,30 +1491,26 @@ impl VoipHub {
                 "speakerLabels": "track",
                 "segments": call.segment_seq.load(Ordering::SeqCst),
             });
-            body["flaggedMoments"] = json!(state.flags.len());
+            body["flaggedMoments"] = json!(state.flag_count);
             body["video"] = json!({
                 "enabled": state.video.enabled,
                 "fps": state.video.fps,
                 "format": state.video.format,
                 "extraFrames": state.video.extra_frames,
-                // Frames lived in memory until analysed; none was stored.
+                // Frames are held in memory only until their segment is written, and only a
+                // segmented participant's frames are written (`call-segment`).
                 "framesRetained": false,
             });
-            body["analysis"] = match &analysis {
+            body["segments"] = match &segments {
                 None => json!({"status": "off"}),
                 Some(settings) => json!({
-                    "status": if tally.unavailable.is_some() { "unavailable" } else { "complete" },
-                    "detail": tally.unavailable,
-                    "channel": settings.channel,
-                    "provider": tally.provider,
-                    "model": tally.model,
-                    "when": settings.timing.as_str(),
+                    "status": if hub.recorder.is_none() { "unavailable" } else { "complete" },
                     "segmentMs": settings.segment_ms,
-                    "segments": tally.segments,
-                    "results": tally.results,
+                    "maxFrames": settings.max_frames,
+                    "roles": settings.roles,
+                    "delivered": tally.delivered,
                     "failed": tally.failed,
-                    "analysedRoles": settings.roles,
-                    "allowStaff": settings.allow_staff,
+                    "skipped": tally.skipped,
                 }),
             };
             hub.enqueue_json(&call, EventKind::CallHangup, extra, body);
@@ -1512,7 +1656,8 @@ impl VoipHub {
                     target.session.video.clone(),
                     target.settings.dead_air_ms,
                     max_seconds,
-                );
+                )
+                .with_segments(target.module.segments.clone());
                 meeting.record_after_consent = target.session.record_after_consent;
                 *lock(&call.meeting) = Some(meeting);
             }
@@ -2004,9 +2149,11 @@ impl VoipHub {
         if self.call(&call_id).is_some() {
             return Ok(json!({"callId": call_id, "status": "originating"}));
         }
+        let audit_context = crate::audit::context_of(&message.headers);
         if let Err(refusal) = self.originate_guard.check(&raw_destination, &destination) {
-            return Err(refuse_originate(
+            return Err(self.refuse_originate(
                 module_key,
+                audit_context.as_ref(),
                 &call_id,
                 &raw_destination,
                 &refusal,
@@ -2014,13 +2161,32 @@ impl VoipHub {
         }
         let listen_only = field(&["mode"], "x-call-mode")
             .is_some_and(|m| m.trim().eq_ignore_ascii_case(MODE_LISTEN));
-        let record = message
+        let captured = message
             .headers
             .get(sutra_channels::AUDIT_CAPTURE_HEADER)
             .is_some_and(|v| {
                 v.trim()
                     .eq_ignore_ascii_case(sutra_channels::AUDIT_CAPTURE_MEDIA)
             });
+        // `record`: `true`, `after-consent` (the recording starts once an announcement marked
+        // `consent: true` has played to the end, as on a `record: after-consent` channel) or
+        // `false`. A request the process marked `capture=media` is recorded either way.
+        let (asked, after_consent) =
+            match field(&["record"], "x-record")
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("false") => (false, false),
+                Some("true") => (true, false),
+                Some("after-consent") => (true, true),
+                Some(other) => return Err(OpError::permanent(
+                    codes::OUTBOUND_INVALID,
+                    format!(
+                        "originate 'record' must be true, false or after-consent, got '{other}'"
+                    ),
+                )),
+            };
+        let record = captured || asked;
         if record && self.recorder.is_none() {
             return Err(OpError::permanent(
                 codes::RECORDING_UNAVAILABLE,
@@ -2085,8 +2251,11 @@ impl VoipHub {
             },
         );
         call.attached.store(true, Ordering::SeqCst);
+        *lock(&call.audit) = audit_context;
         call.listen_only.store(listen_only, Ordering::SeqCst);
         call.record.store(record, Ordering::SeqCst);
+        call.record_after_consent
+            .store(record && after_consent, Ordering::SeqCst);
         if let Err(error) = self.gateway.originate(&request).await {
             call.ended.store(true, Ordering::SeqCst);
             lock(&self.calls).remove(&call_id);
@@ -2097,6 +2266,7 @@ impl VoipHub {
             "status": "originating",
             "mode": if listen_only { MODE_LISTEN } else { "conversation" },
             "recorded": record,
+            "record": if !record { "false" } else if after_consent { "after-consent" } else { "true" },
         }))
     }
 
@@ -2317,6 +2487,16 @@ impl VoipHub {
                 .as_ref()
                 .is_some_and(|s| s.consent_at_ms.is_some());
         if !asserted && !announced {
+            let module_key = lock(&call.meta)
+                .module
+                .as_ref()
+                .map(|m| m.module_key.clone());
+            self.audit.append(
+                crate::audit::scope_of(lock(&call.audit).as_ref(), module_key.as_deref()),
+                crate::audit::event(crate::audit::events::CONSENT_REQUIRED)
+                    .with_field("callId", call.call_id.clone())
+                    .with_diagnostic_code(codes::CONSENT_REQUIRED),
+            );
             return Err(OpError::permanent(
                 codes::CONSENT_REQUIRED,
                 "record-start: recording needs consent first — play the announcement with                  `consent: true` (to the end), or send `consent: true` once the caller agreed",
@@ -2485,7 +2665,15 @@ impl VoipHub {
                 },
             )
             .await;
-            tracing::warn!(target: "sutra.audit", event = "VOIP_RECORDING_RECOVERED_DELIVERED", call_id = %call_id, recordings = recordings.len(), decision = ?decision, "voip: a recovered recording was delivered to its call's flow");
+            tracing::warn!(call_id = %call_id, recordings = recordings.len(), decision = ?decision, "voip: a recovered recording was delivered to its call's flow");
+            self.audit.append(
+                crate::audit::scope_of(owner.audit.as_ref(), Some(&owner.module_key)),
+                crate::audit::event(crate::audit::events::RECORDING_RECOVERED_DELIVERED)
+                    .with_field("callId", call_id.clone())
+                    .with_field("recordings", recordings.len())
+                    .with_field("decision", format!("{decision:?}"))
+                    .with_diagnostic_code(codes::RECORDING_RECOVERED),
+            );
             for recording in &recordings {
                 recorder.mark_delivered(&recording.key).await;
             }
@@ -2501,6 +2689,11 @@ impl VoipHub {
         message: &OutboundMessage,
         wait: bool,
     ) -> Result<Value, OpError> {
+        if operation != "originate" {
+            if let Some(call) = call_id_of(message).and_then(|id| self.call(&id)) {
+                self.note_audit_context(&call, message);
+            }
+        }
         match operation {
             "originate" => self.originate(module_key, message).await,
             "play" => self.play(message, wait).await,
@@ -2515,6 +2708,63 @@ impl VoipHub {
                     "unknown voip operation '{other}' (originate, play, hangup, transfer, dtmf, record-start, record-stop)"
                 ),
             )),
+        }
+    }
+
+    /// The refusal of an originate the toll-fraud controls stopped: an audit event (to the
+    /// requesting instance's journal, or the deployment's when the request carried no routing),
+    /// and the diagnostic the flow sees (a rate limit is retryable; the rest are not).
+    fn refuse_originate(
+        &self,
+        module_key: Option<&str>,
+        context: Option<&sutra_channels::TransportAuditContext>,
+        call_id: &str,
+        destination: &str,
+        refusal: &Refusal,
+    ) -> OpError {
+        let masked = crate::policy::masked(destination);
+        tracing::warn!(
+            rule = refusal.rule(),
+            module = module_key.unwrap_or_default(),
+            call_id = %call_id,
+            destination = %masked,
+            "voip: originate refused ({}): {}",
+            refusal.rule(),
+            refusal.explain()
+        );
+        let (name, code) = if refusal.is_rate_limit() {
+            (
+                crate::audit::events::ORIGINATE_RATE_LIMITED,
+                codes::ORIGINATE_RATE_LIMITED,
+            )
+        } else {
+            (
+                crate::audit::events::ORIGINATE_REFUSED,
+                codes::ORIGINATE_REFUSED,
+            )
+        };
+        let module_key = module_key.map(str::to_string).or_else(|| {
+            self.routes()
+                .module_for_outbound(None)
+                .map(|m| m.module_key.clone())
+        });
+        self.audit.append(
+            crate::audit::scope_of(context, module_key.as_deref()),
+            crate::audit::event(name)
+                .with_field("rule", refusal.rule())
+                .with_field("callId", call_id.to_string())
+                .with_sensitive_field("destination", masked.clone())
+                .with_diagnostic_code(code),
+        );
+        let message = format!(
+            "originate to {masked} refused ({}): {}",
+            refusal.rule(),
+            refusal.explain()
+        );
+        if refusal.is_rate_limit() {
+            OpError::retryable(codes::ORIGINATE_RATE_LIMITED, message)
+        } else {
+            OpError::permanent(codes::ORIGINATE_REFUSED, message)
         }
     }
 
@@ -2546,56 +2796,6 @@ async fn deliver_with_requeue(intake: &dyn InboundIntake, delivery: &Delivery) -
         decision = intake.deliver(delivery.message.clone()).await;
     }
     decision
-}
-
-/// A participant's analysis digest with its most frequent emotion and engagement level
-/// (`dominantEmotion`, `dominantEngagement`; ties go to the first in name order).
-fn with_dominants(mut digest: Value) -> Value {
-    let dominant = |counts: &Value| -> Value {
-        counts
-            .as_object()
-            .and_then(|map| {
-                map.iter()
-                    .max_by(|a, b| a.1.as_u64().cmp(&b.1.as_u64()).then_with(|| b.0.cmp(a.0)))
-                    .map(|(name, _)| json!(name))
-            })
-            .unwrap_or(Value::Null)
-    };
-    digest["dominantEmotion"] = dominant(&digest["emotions"]);
-    digest["dominantEngagement"] = dominant(&digest["engagement"]);
-    digest
-}
-
-/// The refusal of an originate the toll-fraud controls stopped: an audit event, and the
-/// diagnostic the flow sees (a rate limit is retryable; the rest are not).
-fn refuse_originate(
-    module_key: Option<&str>,
-    call_id: &str,
-    destination: &str,
-    refusal: &Refusal,
-) -> OpError {
-    let masked = crate::policy::masked(destination);
-    tracing::warn!(
-        target: "sutra.audit",
-        event = "VOIP_ORIGINATE_REFUSED",
-        rule = refusal.rule(),
-        module = module_key.unwrap_or_default(),
-        call_id = %call_id,
-        destination = %masked,
-        "voip: originate refused ({}): {}",
-        refusal.rule(),
-        refusal.explain()
-    );
-    let message = format!(
-        "originate to {masked} refused ({}): {}",
-        refusal.rule(),
-        refusal.explain()
-    );
-    if refusal.is_rate_limit() {
-        OpError::retryable(codes::ORIGINATE_RATE_LIMITED, message)
-    } else {
-        OpError::permanent(codes::ORIGINATE_REFUSED, message)
-    }
 }
 
 /// Complete the recordings of a call whose end is not delivered.

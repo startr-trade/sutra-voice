@@ -55,8 +55,9 @@
 //! `video.fps` (1), `video.enabled` (true), `video.format` (`image/jpeg`), `video.max-width`
 //! (640), `video.quality` (70), `video.extra-frames` (true: a frame of every participant at
 //! turn boundaries and audio-flagged moments). A `call-participant` channel receives joins and
-//! leaves; a `call-analysis` channel turns on per-participant, per-segment analysis, see
-//! [`crate::meeting::AnalysisSettings`].
+//! leaves; a `call-segment` channel cuts the session into per-participant media segments
+//! (written to the recording store, delivered to the flow as references), see
+//! [`crate::meeting::SegmentSettings`]. Analysis of the segments is the flow's.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -481,8 +482,8 @@ pub enum EventKind {
     CallKeyword,
     /// A participant of a meeting session joined or left.
     CallParticipant,
-    /// One participant's analysis for one time segment of a meeting session.
-    CallAnalysis,
+    /// One participant's media over one time segment of a meeting session, as references.
+    CallSegment,
 }
 
 impl EventKind {
@@ -495,7 +496,7 @@ impl EventKind {
         EventKind::CallTranscript,
         EventKind::CallKeyword,
         EventKind::CallParticipant,
-        EventKind::CallAnalysis,
+        EventKind::CallSegment,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -508,7 +509,7 @@ impl EventKind {
             EventKind::CallTranscript => "call-transcript",
             EventKind::CallKeyword => "call-keyword",
             EventKind::CallParticipant => "call-participant",
-            EventKind::CallAnalysis => "call-analysis",
+            EventKind::CallSegment => "call-segment",
         }
     }
 
@@ -696,9 +697,9 @@ pub struct ModuleRoute {
     pub transcribe: Option<TranscribeSettings>,
     /// The phrases the `call-keyword` channel reports, lower-cased.
     pub keyword_phrases: Vec<String>,
-    /// Per-participant, per-segment analysis of meeting sessions (the `call-analysis`
-    /// channel's `analyze.*`).
-    pub analysis: Option<crate::meeting::AnalysisSettings>,
+    /// How meeting sessions are cut into per-participant media segments (the `call-segment`
+    /// channel's `segment.*`).
+    pub segments: Option<crate::meeting::SegmentSettings>,
 }
 
 /// How a listen-only call is transcribed: a live audio session opened through an `llm` channel
@@ -711,7 +712,7 @@ pub struct TranscribeSettings {
     pub drain_ms: u64,
 }
 
-/// `transcribe.*` / `analyze.*` keys that named a provider directly. The model is configured on
+/// `transcribe.*` keys that named a provider directly. The model is configured on
 /// the `llm` channel the block names instead, so they are refused with a pointer to it.
 pub const DIRECT_MODEL_KEYS: [&str; 6] = [
     "provider",
@@ -745,20 +746,17 @@ pub(crate) fn refuse_direct_model_keys(
     Ok(())
 }
 
-/// What a `transcribe.channel` / `analyze.channel` reference needs of the `llm` channel.
+/// What a `transcribe.channel` reference needs of the `llm` channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelChannelUse {
     /// Live transcription: the channel must `require: [realtime]`.
     Transcription,
-    /// Segment analysis: the channel must `require: [video-understanding]`.
-    Analysis,
 }
 
 impl ModelChannelUse {
     fn required(self) -> &'static str {
         match self {
             ModelChannelUse::Transcription => "realtime",
-            ModelChannelUse::Analysis => "video-understanding",
         }
     }
 }
@@ -944,6 +942,16 @@ impl RouteSet {
 pub fn event_kind_of(definition: &ChannelDefinition) -> Result<EventKind, Diagnostic> {
     let name = &definition.binding.channel_name;
     if let Some(event) = definition.properties.get("event") {
+        if event.trim().eq_ignore_ascii_case("call-analysis") {
+            return Err(Diagnostic::error(
+                codes::CHANNEL_INVALID,
+                format!(
+                    "channel '{name}': 'call-analysis' was replaced by 'call-segment': the transport \
+                     delivers each segment's media as references, and the flow analyses them \
+                     (an `llm` channel with a `media-store`)"
+                ),
+            ));
+        }
         return EventKind::parse(event).ok_or_else(|| {
             Diagnostic::error(
                 codes::CHANNEL_INVALID,
@@ -962,7 +970,7 @@ pub fn event_kind_of(definition: &ChannelDefinition) -> Result<EventKind, Diagno
         None => EventKind::parse(name).ok_or_else(|| {
             Diagnostic::error(
                 codes::CHANNEL_INVALID,
-                format!("channel '{name}': declare 'event:' (call-start, call-turn, call-dtmf, call-progress, call-hangup, call-transcript, call-keyword, call-participant, call-analysis)"),
+                format!("channel '{name}': declare 'event:' (call-start, call-turn, call-dtmf, call-progress, call-hangup, call-transcript, call-keyword, call-participant, call-segment)"),
             )
         }),
     }
@@ -999,8 +1007,9 @@ pub fn route_set_of(definitions: &[ChannelDefinition]) -> Result<RouteSet, Diagn
             progress_statuses: None,
             transcribe: None,
             keyword_phrases: Vec::new(),
-            analysis: None,
+            segments: None,
         });
+        crate::meeting::refuse_analysis_keys(definition)?;
         if CallSettings::declares_any(definition) && module.settings == CallSettings::default() {
             module.settings = CallSettings::from_definition(definition, CallSettings::default())?;
         }
@@ -1040,8 +1049,8 @@ pub fn route_set_of(definitions: &[ChannelDefinition]) -> Result<RouteSet, Diagn
         if kind == EventKind::CallKeyword {
             module.keyword_phrases = keyword_phrases_of(definition);
         }
-        if kind == EventKind::CallAnalysis {
-            module.analysis = crate::meeting::AnalysisSettings::parse(definition, definitions)?;
+        if kind == EventKind::CallSegment {
+            module.segments = Some(crate::meeting::SegmentSettings::parse(definition)?);
         }
         module
             .channels

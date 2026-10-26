@@ -1,22 +1,25 @@
 //! Meeting sessions end to end on the hub: a scripted gateway streams two participants on one
-//! tagged socket (each its own audio and sampled frames), a scripted live session transcribes
-//! each participant's track, and a scripted video-understanding model analyses the segments —
-//! both reached through `llm` channels of the deployment, the analysis falling back from a
-//! first candidate that is down to the second.
+//! tagged socket (each its own audio and sampled frames), and a scripted live session
+//! transcribes each participant's track through an `llm` channel of the deployment.
 //! Proven: the sampling policy reaches the gateway, a turn boundary asks for a frame of
-//! everyone, transcripts are attributed to the track they came from, only the external
-//! participant is analysed (the staff one never reaches the model), the model's answer is
-//! stripped of a sensitive inference, and the hang-up carries a sealed recording per
-//! participant whose SHA-256 is the stored object's.
+//! everyone, transcripts are attributed to the track they came from, each closed segment of the
+//! segmented (external) participant is written to the store — its audio and frames as sealed
+//! objects the engine's `media-store` opens — and delivered as media references on
+//! `call-segment` (the staff participant is never cut into segments), and the hang-up carries a
+//! sealed recording per participant whose SHA-256 is the stored object's. No model is called by
+//! the transport: analysis is the flow's. A thirty-minute session holds bounded memory per
+//! participant.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sutra_llm_spi::{
     AudioSession, AudioSessionConfig, AudioSessionEvent, BoxFuture, Diagnostic, LlmFailure,
-    LlmProvider, LlmProviderConfig, LlmProviderFactory, LlmRequest, LlmResponse, LlmVideo,
+    LlmProvider, LlmProviderConfig, LlmProviderFactory, LlmRequest, LlmResponse,
 };
+use sutra_objectstore::{MemoryObjectStore, ObjectStore, StoreLocation};
 use sutra_transport_voip::audio::{pcm16_to_le, wav_unwrap};
 use sutra_transport_voip::config::route_set_of;
 use sutra_transport_voip::gateway::{GatewayControl, GenericGateway};
@@ -24,14 +27,13 @@ use sutra_transport_voip::hub::VoipHub;
 use sutra_transport_voip::listen::Recorder;
 use sutra_transport_voip::media::media_router;
 use sutra_transport_voip::meeting::{
-    effective_role, pick_frames, strip_forbidden, AnalysisPolicy, SampledFrame, SpeechChange,
-    SpeechTracker,
+    effective_role, pick_frames, MeetingState, SampledFrame, SegmentSettings, SpeechChange,
+    SpeechTracker, TranscriptLine, VideoPolicy,
 };
 use sutra_transport_voip::protocol::{
-    parse_generic_text, parse_tagged, GenericFrame, TaggedHeader, TaggedKind,
+    parse_generic_text, parse_tagged, GenericFrame, ParticipantJoined, TaggedHeader, TaggedKind,
 };
 use sutra_transport_voip::recording::open_stream;
-use sutra_transport_voip::store::{MemoryRecordingStore, RecordingStore, StoreLocation};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -64,13 +66,13 @@ channels:
     transcribe:
       channel: meeting-transcription
       drain-ms: 500
-  - name: analysis
+  - name: segment
     transport: voip
-    event: call-analysis
-    analyze:
-      channel: video-analysis
-      segment-seconds: 2
+    event: call-segment
+    segment:
+      seconds: 2
       max-frames: 4
+      roles: [external]
   - name: meeting-transcription
     transport: llm
     direction: outbound
@@ -81,19 +83,6 @@ channels:
       candidates:
         - provider: test-meeting-live
           model: live-test
-  - name: video-analysis
-    transport: llm
-    direction: outbound
-    bind: "llm://video-analysis"
-    ack-mode: on-complete
-    llm:
-      require: [video-understanding]
-      timeout-seconds: 5
-      candidates:
-        - provider: test-video
-          model: video-down
-        - provider: test-video
-          model: video-test
 "#;
 
 // ---- a scripted live session: one segment per session, after 1 s of audio -----------------------
@@ -188,81 +177,6 @@ inventory::submit! {
     LlmProviderFactory { provider: "test-meeting-live", build: build_meeting_live }
 }
 
-// ---- a scripted video-understanding model ------------------------------------------------------
-
-/// (prompt text, frames, has audio) of every analysis request.
-static ANALYSED: Mutex<Vec<(String, usize, bool)>> = Mutex::new(Vec::new());
-/// How many analysis requests the `video-down` candidate refused.
-static REFUSED_DOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// `video-down` is overloaded on every request; any other model answers.
-struct VideoModel {
-    model: String,
-}
-
-impl LlmProvider for VideoModel {
-    fn capabilities(&self) -> sutra_llm_spi::LlmCapabilities {
-        sutra_llm_spi::LlmCapabilities {
-            json_output: true,
-            audio_input: true,
-            audio_understanding: true,
-            video_understanding: true,
-            ..Default::default()
-        }
-    }
-
-    fn complete<'a>(
-        &'a self,
-        request: &'a LlmRequest,
-    ) -> BoxFuture<'a, Result<LlmResponse, LlmFailure>> {
-        Box::pin(async move {
-            if self.model == "video-down" {
-                REFUSED_DOWN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                return Err(LlmFailure::Retryable {
-                    class: sutra_llm_spi::RetryableClass::RateLimited,
-                    retry_after: None,
-                    detail: "overloaded".into(),
-                });
-            }
-            let message = &request.messages[0];
-            let frames = match &message.video {
-                Some(LlmVideo::Frames(frames)) => frames.len(),
-                _ => 0,
-            };
-            ANALYSED.lock().unwrap().push((
-                message.content.clone(),
-                frames,
-                message.audio.is_some(),
-            ));
-            let answer = json!({
-                "expression": "attentive",
-                "engagement": "high",
-                "attention": "on the speaker",
-                "bodyLanguage": ["nodding"],
-                "emotion": {"label": "interested", "confidence": 0.7,
-                            "modalities": {"voice": true, "face": true, "body": true, "words": true}},
-                "disagreement": {"flagged": false, "detail": null},
-                "age": 41,
-                "reactions": [{"atMs": 300, "to": "P2", "cue": "nods", "Gender": "x"}],
-            });
-            Ok(LlmResponse::text(
-                format!("```json\n{answer}\n```"),
-                sutra_llm_spi::FinishReason::Stop,
-            ))
-        })
-    }
-}
-
-fn build_video(config: &LlmProviderConfig) -> Result<Arc<dyn LlmProvider>, Diagnostic> {
-    Ok(Arc::new(VideoModel {
-        model: config.model.clone(),
-    }))
-}
-
-inventory::submit! {
-    LlmProviderFactory { provider: "test-video", build: build_video }
-}
-
 // ---- the session ----------------------------------------------------------------------------------
 
 fn json_of(message: &sutra_channels::InboundMessage) -> Value {
@@ -295,15 +209,15 @@ fn video_frame(index: u16, at_ms: u64, requested: bool, n: u8) -> Message {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_meeting_session_is_attributed_sampled_analysed_per_role_and_recorded_per_participant() {
+async fn a_meeting_session_is_attributed_sampled_segmented_per_role_and_recorded_per_participant() {
     let (intake, mut rx) = FakeIntake::new();
     let defs = definitions(SESSION_CHANNELS, "video-meetings");
     publish_llm_channels(&defs);
     let routes = route_set_of(&defs).unwrap();
     let store =
-        MemoryRecordingStore::new(StoreLocation::parse("memory://recordings/meetings").unwrap());
+        MemoryObjectStore::new(StoreLocation::parse("memory://recordings/meetings").unwrap());
     let recorder = Arc::new(Recorder::new(
-        Arc::new(store.clone()) as Arc<dyn RecordingStore>,
+        Arc::new(store.clone()) as Arc<dyn ObjectStore>,
         Some(KEK),
         "rec-key",
         60,
@@ -376,10 +290,11 @@ async fn a_meeting_session_is_attributed_sampled_analysed_per_role_and_recorded_
         json_of(&next_on(&mut rx, "participant").await),
     ];
     assert_eq!(joined[0]["participantId"], "PA_sam");
-    assert_eq!(joined[0]["analysed"], true);
+    assert_eq!(joined[0]["role"], "external");
+    assert_eq!(joined[0]["segmented"], true);
     assert_eq!(joined[1]["participantId"], "PA_alex");
-    assert_eq!(joined[1]["analysed"], false);
-    assert_eq!(joined[1]["analysisPolicy"], "staff-not-opted-in");
+    assert_eq!(joined[1]["segmented"], false);
+    assert!(joined[1].get("analysed").is_none(), "{}", joined[1]);
 
     // 3.2 s in real time: Sam speaks 0.2-1.4 s, Alex 1.6-2.6 s; both cameras at 2 fps.
     let loud = tone(220.0, 20, RATE, 9000.0);
@@ -450,73 +365,125 @@ async fn a_meeting_session_is_attributed_sampled_analysed_per_role_and_recorded_
         assert!(t["startMs"].as_u64().unwrap() >= 200, "{t}");
     }
 
-    // The hang-up comes after every analysis; only Sam's segments were analysed.
-    let mut analyses = Vec::new();
+    // The hang-up comes after every segment; only Sam was cut into segments.
+    let mut segments = Vec::new();
     let hangup = loop {
         let message = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
             .await
             .expect("the hang-up within 10 s")
             .unwrap();
         match message.channel.as_str() {
-            "analysis" => analyses.push(json_of(&message)),
+            "segment" => {
+                assert_eq!(message.headers["x-participant-id"], "PA_sam");
+                segments.push(json_of(&message))
+            }
             "hangup" => break json_of(&message),
             _ => {}
         }
     };
-    assert_eq!(analyses.len(), 2, "two 2 s segments of Sam: {analyses:?}");
-    for (i, a) in analyses.iter().enumerate() {
-        assert_eq!(a["participantId"], "PA_sam");
-        assert_eq!(a["segment"], i as u64 + 1);
-        assert_eq!(a["status"], "complete");
-        assert_eq!(a["result"]["emotion"]["label"], "interested");
-        assert!(a["result"].get("age").is_none(), "{a}");
-        assert!(a["result"]["reactions"][0].get("Gender").is_none(), "{a}");
-        assert_eq!(a["removedKeys"], json!(["age", "reactions.0.Gender"]));
-        let frames = a["frames"].as_u64().unwrap();
-        assert!((1..=4).contains(&frames), "{a}");
-        assert_eq!(a["audioSent"], true);
-        assert_eq!(a["key"], format!("standup-1:1:{}", i + 1));
-        // Through the channel: the first candidate was overloaded, the second answered.
-        assert_eq!(a["channel"], "video-analysis");
-        assert_eq!(a["provider"], "test-video");
-        assert_eq!(a["model"], "video-test");
-    }
-    assert_eq!(
-        REFUSED_DOWN.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "each segment was tried on the first candidate first"
-    );
-    let analysed = ANALYSED.lock().unwrap().clone();
-    assert_eq!(analysed.len(), 2);
-    for (prompt, frames, audio) in &analysed {
-        assert!(prompt.starts_with("Analyse participant P1 "), "{prompt}");
-        assert!(
-            !prompt.contains("Sam") && !prompt.contains("Alex"),
-            "pseudonyms only: {prompt}"
+    assert_eq!(segments.len(), 2, "two 2 s segments of Sam: {segments:?}");
+    let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
+    for (i, s) in segments.iter().enumerate() {
+        assert_eq!(s["status"], "complete", "{s}");
+        assert_eq!(s["participantId"], "PA_sam");
+        assert_eq!(s["participant"], "P1");
+        assert_eq!(s["role"], "external");
+        assert_eq!(s["segment"], i as u64 + 1);
+        assert_eq!(s["key"], format!("standup-1:1:{}", i + 1));
+        assert_eq!(s["startMs"], i as u64 * 2000);
+        assert!(s["features"]["durationMs"].as_u64().is_some(), "{s}");
+        assert!(s["present"].as_array().unwrap().len() == 2, "{s}");
+        // The audio: a media reference to a sealed WAV file of exactly this segment.
+        let audio = &s["audio"];
+        assert_eq!(audio["kind"], "media");
+        assert_eq!(audio["participant"], "PA_sam");
+        assert_eq!(audio["startMs"], s["startMs"]);
+        assert_eq!(audio["endMs"], s["endMs"]);
+        assert_eq!(audio["format"], "audio/wav");
+        assert_eq!(audio["sealed"], true);
+        let uri = audio["uri"].as_str().unwrap();
+        let expected = format!(
+            "acme/video-meetings/1.0.0/standup-1/segments/p1/{}.wav.sealed",
+            i + 1
         );
-        assert!(*frames >= 1 && *audio);
+        assert!(uri.ends_with(&expected), "{uri}");
+        let full = uri.strip_prefix("memory://recordings/").unwrap();
+        let stored = store
+            .get(full.strip_prefix("meetings/").unwrap())
+            .await
+            .unwrap()
+            .expect("the segment is stored");
+        assert_eq!(audio["sha256"], sutra_objectstore::sha256_hex(&stored));
+        assert!(stored.starts_with(sutra_objectstore::sealed::MAGIC));
+        let (header, wav) = sutra_objectstore::sealed::open(&kek, full, &stored).unwrap();
+        assert_eq!(header.content_type, "audio/wav");
+        let (samples, rate) = wav_unwrap(&wav).unwrap();
+        assert_eq!(rate, RATE);
+        // The first segment whole; the last one cut short at the session's end.
+        let ms = samples.len() as u64 * 1000 / RATE as u64;
+        assert_eq!(ms, audio["durationMs"].as_u64().unwrap(), "{s}");
+        assert!(
+            if i == 0 {
+                ms == 2000
+            } else {
+                (1000..=2000).contains(&ms)
+            },
+            "{s}"
+        );
+        // The frames: each a sealed image of its own.
+        let frames = s["frames"].as_array().unwrap();
+        assert!((1..=4).contains(&frames.len()), "{s}");
+        for frame in frames {
+            assert_eq!(frame["kind"], "media");
+            assert_eq!(frame["format"], "image/jpeg");
+            let full = frame["uri"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("memory://recordings/")
+                .unwrap();
+            let stored = store
+                .get(full.strip_prefix("meetings/").unwrap())
+                .await
+                .unwrap()
+                .expect("the frame is stored");
+            assert_eq!(frame["sha256"], sutra_objectstore::sha256_hex(&stored));
+            let (_, image) = sutra_objectstore::sealed::open(&kek, full, &stored).unwrap();
+            assert_eq!(&image[..2], &[0xFF, 0xD8], "a JPEG");
+            assert!(frame["atMs"].as_u64().unwrap() < 2000);
+        }
     }
+    // The words spoken in the first segment, with pseudonymised speakers.
+    let words = segments[0]["words"].as_array().unwrap();
+    assert!(
+        words
+            .iter()
+            .all(|w| w["speaker"] == "P1" || w["speaker"] == "P2"),
+        "{words:?}"
+    );
+    // Alex (staff) never had a segment written.
+    assert!(store.keys().iter().all(|k| !k.contains("/segments/p2/")));
 
     assert_eq!(hangup["session"], "meeting");
-    assert_eq!(hangup["analysis"]["results"], 2);
-    assert_eq!(hangup["analysis"]["channel"], "video-analysis");
-    assert_eq!(hangup["analysis"]["model"], "video-test");
-    assert_eq!(hangup["analysis"]["analysedRoles"], json!(["external"]));
+    assert!(hangup.get("analysis").is_none(), "{hangup}");
+    assert_eq!(hangup["segments"]["delivered"], 2);
+    assert_eq!(hangup["segments"]["failed"], 0);
+    assert_eq!(hangup["segments"]["segmentMs"], 2000);
+    assert_eq!(hangup["segments"]["roles"], json!(["external"]));
     assert_eq!(hangup["video"]["framesRetained"], false);
     let participants = hangup["participants"].as_array().unwrap();
     assert_eq!(participants.len(), 2);
-    assert_eq!(participants[0]["analysed"], true);
-    assert_eq!(participants[0]["analysis"]["segments"], 2);
-    assert_eq!(participants[1]["analysed"], false);
-    assert!(participants[1]["analysis"].is_null());
+    assert_eq!(participants[0]["segmented"], true);
+    assert_eq!(participants[0]["segments"], 2);
+    assert_eq!(participants[1]["segmented"], false);
+    assert_eq!(participants[1]["segments"], 0);
     for p in participants {
         assert_eq!(p["video"]["regular"], 7, "{p}");
         assert_eq!(p["video"]["requested"], 1, "{p}");
         assert!(p["talkMs"].as_u64().unwrap() >= 800, "{p}");
+        assert_eq!(p["transcriptLines"], 1, "{p}");
     }
     let recordings = hangup["recordings"].as_array().unwrap();
     assert_eq!(recordings.len(), 2);
-    let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
     for (i, reference) in recordings.iter().enumerate() {
         let uri = reference["uri"].as_str().unwrap();
         let expected = format!("acme/video-meetings/1.0.0/standup-1/p{}.wav.sealed", i + 1);
@@ -542,111 +509,224 @@ async fn a_meeting_session_is_attributed_sampled_analysed_per_role_and_recorded_
     }
 }
 
-// ---- the policy and the pieces ------------------------------------------------------------------
+// ---- bounded memory -------------------------------------------------------------------------------
 
-/// `analyze.channel` must name an `llm` channel that requires video understanding; a model
-/// named on the voip channel itself is refused.
+/// Thirty minutes of a two-person session on a manual clock: 20 ms audio frames from both, a
+/// camera frame of each every second, a transcript line every five seconds, segments cut every
+/// second as the hub cuts them. What each participant holds in memory stops growing once the
+/// first window has filled: the peak over the whole half hour is the peak of the first five
+/// minutes, and stays under a bound set by the window, not by the meeting's length.
 #[test]
-fn an_analysis_channel_reference_is_validated_at_load() {
-    let yaml = |analyze: &str, require: &str| {
-        format!(
-            r#"
-channels:
-  - name: analysis
-    transport: voip
-    event: call-analysis
-    analyze:
-{analyze}
-  - name: video-analysis
-    transport: llm
-    direction: outbound
-    bind: "llm://video-analysis"
-    ack-mode: on-complete
-    llm:
-{require}
-      candidates:
-        - provider: test-video
-          model: video-test
-"#
-        )
+fn a_long_meeting_holds_bounded_memory_per_participant() {
+    let clock = Arc::new(AtomicU64::new(0));
+    let settings = SegmentSettings {
+        segment_ms: 10_000,
+        max_frames: 8,
+        roles: None,
+        default_role: "unknown".into(),
     };
-    let require = "      require: [video-understanding]";
-    let refused = |yaml: String| {
-        let error = route_set_of(&definitions(&yaml, "m")).unwrap_err();
-        assert_eq!(
-            error.code, "SUTRA.VOIP.MODEL_CHANNEL_INVALID",
-            "{}",
-            error.message
+    let window_s = settings.tap_window_seconds();
+    let mut state = MeetingState::new(RATE, false, VideoPolicy::default(), 2000, 7200)
+        .with_segments(Some(settings))
+        .with_manual_clock(Arc::clone(&clock));
+    let vad = sutra_transport_voip::vad::VadConfig::default();
+    for (id, index) in [("PA_1", 1u16), ("PA_2", 2)] {
+        state.join(
+            &ParticipantJoined {
+                participant_id: id.into(),
+                index,
+                label: None,
+                role: Some("external".into()),
+                at_ms: Some(0),
+            },
+            &vad,
         );
-        error.message
-    };
-    let direct = refused(yaml(
-        "      provider: test-video\n      model: video-test",
-        require,
-    ));
-    assert!(direct.contains("analyze.provider"), "{direct}");
-    let undeclared = refused(yaml(
-        "      channel: video-analysis",
-        "      require: [json-output]",
-    ));
-    assert!(
-        undeclared.contains("require: [video-understanding]"),
-        "{undeclared}"
+    }
+    let speech = tone(220.0, 20, RATE, 9000.0);
+    let hush = silence(20, RATE);
+    let image = vec![0xA5u8; 20 * 1024];
+    let (mut segments, mut peak_early, mut peak) = (0usize, 0usize, 0usize);
+    let minutes = 30u64;
+    for step in 0..minutes * 60 * 50 {
+        let now = step * 20;
+        clock.store(now, Ordering::SeqCst);
+        // Each speaks four seconds in eight, out of phase.
+        let first = (now / 4000) % 2 == 0;
+        state.on_audio(1, if first { &speech } else { &hush });
+        state.on_audio(2, if first { &hush } else { &speech });
+        if now % 1000 == 0 {
+            state.on_frame(1, &image, false);
+            state.on_frame(2, &image, false);
+            let (taken, _) = state.take_segments(now.saturating_sub(2000), false);
+            segments += taken.len();
+        }
+        if now % 5000 == 0 && now > 0 {
+            for index in [1, 2] {
+                state.add_line(
+                    index,
+                    TranscriptLine {
+                        start_ms: now - 4000,
+                        end_ms: now - 500,
+                        text: "a line of the meeting, as the live session wrote it".into(),
+                    },
+                );
+            }
+        }
+        let bytes = state.memory_bytes();
+        peak = peak.max(bytes);
+        if now < 5 * 60 * 1000 {
+            peak_early = peak_early.max(bytes);
+        }
+    }
+    // Every closed segment of both participants was cut.
+    let closed = ((minutes * 60 * 1000 - 2000) / 10_000) as usize;
+    assert!(segments >= 2 * (closed - 1), "{segments} segments");
+    // The window: at most 9/8 of it (the tap trims back in steps), PCM16.
+    let audio_bound = (window_s * u64::from(RATE) * 2 * 9 / 8) as usize;
+    // Frames: one a second, kept until their segment is written (a segment, its lag, a tick).
+    let frame_bound = 16 * image.len();
+    let bound = 2 * (audio_bound + frame_bound + 64 * 1024);
+    eprintln!(
+        "{minutes} min, 2 participants: peak {peak} bytes (first 5 min {peak_early}), bound {bound}"
     );
-    let settings = route_set_of(&definitions(
-        &yaml("      channel: video-analysis", require),
-        "m",
-    ))
-    .unwrap()
-    .modules["acme/m/1.0.0"]
-        .analysis
-        .clone()
-        .unwrap();
-    assert_eq!(settings.channel, "video-analysis");
+    assert!(peak <= bound, "peak {peak} bytes over the bound {bound}");
+    assert!(
+        peak <= peak_early + peak_early / 50,
+        "memory grew with the meeting: {peak_early} bytes in the first 5 min, {peak} over {minutes} min"
+    );
+    for participant in state.participants.values() {
+        assert!(participant.audio.tap.len() <= (window_s * u64::from(RATE) * 9 / 8) as usize);
+        assert!(
+            participant.frames.len() <= 16,
+            "{}",
+            participant.frames.len()
+        );
+        assert!(participant.lines.len() <= 4, "{}", participant.lines.len());
+        assert!(participant.spans.len() <= 4, "{}", participant.spans.len());
+        assert_eq!(participant.line_count, minutes * 60 / 5 - 1);
+    }
+    assert!(state.flags.len() <= 16, "{}", state.flags.len());
 }
 
+/// A session recorded `after-consent` cuts no segment before consent is given: those segments
+/// are skipped (and counted), never written.
 #[test]
-fn a_staff_role_is_refused_for_analysis_without_the_explicit_opt_in() {
-    let yaml = |extra: &str| {
+fn an_after_consent_session_cuts_no_segment_before_consent() {
+    let clock = Arc::new(AtomicU64::new(0));
+    let mut state = MeetingState::new(RATE, true, VideoPolicy::default(), 2000, 600)
+        .with_segments(Some(SegmentSettings {
+            segment_ms: 2000,
+            ..SegmentSettings::default()
+        }))
+        .with_manual_clock(Arc::clone(&clock));
+    state.record_after_consent = true;
+    let vad = sutra_transport_voip::vad::VadConfig::default();
+    state.join(
+        &ParticipantJoined {
+            participant_id: "PA_1".into(),
+            index: 1,
+            label: None,
+            role: None,
+            at_ms: None,
+        },
+        &vad,
+    );
+    let speech = tone(220.0, 20, RATE, 9000.0);
+    for step in 0..300u64 {
+        clock.store(step * 20, Ordering::SeqCst);
+        state.on_audio(1, &speech);
+    }
+    let (taken, skipped) = state.take_segments(6000, false);
+    assert!(taken.is_empty());
+    assert_eq!(skipped, 3);
+    // Consent: the announcement played to the end. The next segment is cut.
+    state.consent_at_ms = Some(6000);
+    for step in 300..450u64 {
+        clock.store(step * 20, Ordering::SeqCst);
+        state.on_audio(1, &speech);
+    }
+    let (taken, skipped) = state.take_segments(9000, true);
+    assert_eq!(skipped, 0);
+    assert_eq!(taken.len(), 2, "segments 4 and the partial 5th");
+    assert_eq!(taken[0].segment, 4);
+}
+
+// ---- the settings and the pieces ------------------------------------------------------------------
+
+#[test]
+fn segment_settings_parse_and_select_by_role() {
+    let yaml = |segment: &str| {
         format!(
             r#"
+channels:
+  - name: segment
+    transport: voip
+    event: call-segment
+{segment}
+"#
+        )
+    };
+    let settings = |segment: &str| {
+        route_set_of(&definitions(&yaml(segment), "m"))
+            .unwrap()
+            .modules["acme/m/1.0.0"]
+            .segments
+            .clone()
+            .unwrap()
+    };
+    let defaults = settings("");
+    assert_eq!(defaults, SegmentSettings::default());
+    assert_eq!(defaults.segment_ms, 10_000);
+    assert!(defaults.segments_role("staff"), "every role by default");
+    let chosen = settings(
+        "    segment:\n      seconds: 5\n      max-frames: 0\n      roles: [external, guest]",
+    );
+    assert_eq!((chosen.segment_ms, chosen.max_frames), (5000, 0));
+    assert!(chosen.segments_role("guest") && !chosen.segments_role("staff"));
+    // An undeclared role is the default role.
+    assert_eq!(effective_role(None, Some(&chosen)), "unknown");
+    assert_eq!(
+        effective_role(Some(" External "), Some(&chosen)),
+        "external"
+    );
+    for bad in [
+        "      seconds: 1",
+        "      seconds: 301",
+        "      max-frames: 33",
+    ] {
+        let error =
+            route_set_of(&definitions(&yaml(&format!("    segment:\n{bad}")), "m")).unwrap_err();
+        assert_eq!(error.code, "SUTRA.VOIP.CHANNEL_INVALID", "{bad}");
+    }
+}
+
+/// Analysis is not the transport's any more: a `call-analysis` channel and `analyze.*` keys are
+/// refused with a pointer to `call-segment` and the flow.
+#[test]
+fn in_transport_analysis_is_refused_with_a_pointer_to_the_flow() {
+    let old = r#"
 channels:
   - name: analysis
     transport: voip
     event: call-analysis
+"#;
+    let error = route_set_of(&definitions(old, "m")).unwrap_err();
+    assert!(error.message.contains("call-segment"), "{}", error.message);
+    let keys = r#"
+channels:
+  - name: segment
+    transport: voip
+    event: call-segment
     analyze:
       channel: video-analysis
-      roles: [external, staff]
-{extra}
-  - name: video-analysis
-    transport: llm
-    direction: outbound
-    bind: "llm://video-analysis"
-    ack-mode: on-complete
-    llm:
-      require: [video-understanding]
-      candidates:
-        - provider: test-video
-          model: video-test
-"#
-        )
-    };
-    let refused = route_set_of(&definitions(&yaml(""), "m")).unwrap_err();
-    assert!(refused.message.contains("AI Act"), "{}", refused.message);
-    let allowed = route_set_of(&definitions(&yaml("      allow-staff: true"), "m")).unwrap();
-    let settings = allowed.modules["acme/m/1.0.0"].analysis.clone().unwrap();
-    assert_eq!(settings.policy_for("staff"), AnalysisPolicy::Analysed);
-    assert_eq!(settings.policy_for("external"), AnalysisPolicy::Analysed);
-    assert_eq!(
-        settings.policy_for("unknown"),
-        AnalysisPolicy::RoleNotAnalysed
+"#;
+    let error = route_set_of(&definitions(keys, "m")).unwrap_err();
+    assert!(
+        error.message.contains("analyze.channel"),
+        "{}",
+        error.message
     );
-    // An undeclared role is not analysed by default.
-    assert_eq!(effective_role(None, Some(&settings)), "unknown");
-    assert_eq!(
-        effective_role(Some(" External "), Some(&settings)),
-        "external"
-    );
+    assert!(error.message.contains("media-store"), "{}", error.message);
 }
 
 #[test]
@@ -699,18 +779,6 @@ fn requested_frames_are_kept_first_and_regular_ones_spread() {
     assert_eq!(picked.len(), 4);
     assert!(picked.iter().any(|f| f.requested));
     assert!(picked.windows(2).all(|w| w[0].at_ms <= w[1].at_ms));
-}
-
-#[test]
-fn sensitive_inferences_are_stripped_at_any_depth() {
-    let mut answer = json!({"emotion": {"label": "calm"}, "Ethnicity": "x",
-                            "cues": [{"sexual_orientation": "y", "cue": "smile"}]});
-    let removed = strip_forbidden(&mut answer);
-    assert_eq!(removed, ["Ethnicity", "cues.0.sexual_orientation"]);
-    assert_eq!(
-        answer,
-        json!({"emotion": {"label": "calm"}, "cues": [{"cue": "smile"}]})
-    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Durable recordings: a call's audio streamed to the object store while the call is up, sealed
 //! chunk by chunk, and recoverable after a crash.
 //!
-//! **Streaming.** A recording is a multipart upload ([`crate::store::RecordingStore`]). The
+//! **Streaming.** A recording is a multipart upload (the engine's `sutra_objectstore::ObjectStore`). The
 //! call's audio is cut into chunks (one second of audio by default); each chunk is sealed and
 //! appended to a local spool file, and every time the spool holds a part's worth (5 MiB, the
 //! smallest part an S3 store accepts) it is uploaded as the next part and the spool emptied.
@@ -49,7 +49,7 @@ use sutra_crypto::{Aes256GcmCipher, Kek, PayloadCipher, WrappedDataKey};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::audio;
-use crate::store::{ObjectStoreError, RecordingStore, UploadedPart};
+use sutra_objectstore::{ObjectStore, ObjectStoreError, UploadedPart};
 
 /// The sealed-stream format's magic prefix.
 pub const SEALED_STREAM_MAGIC: &[u8] = b"SUTRA-SEALED-STREAM-1\n";
@@ -85,7 +85,7 @@ pub const UPLOAD_MARKERS: &str = "sutra-voip-uploads/";
 pub fn upload_marker(key: &str) -> String {
     format!(
         "{UPLOAD_MARKERS}{}{MANIFEST_EXTENSION}",
-        &crate::store::sha256_hex(key.as_bytes())[..32]
+        &sutra_objectstore::sha256_hex(key.as_bytes())[..32]
     )
 }
 
@@ -395,6 +395,9 @@ pub fn open_stream(kek: &Kek, object_key: &str, sealed: &[u8]) -> Result<OpenedS
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordingOwner {
     pub call_id: String,
+    /// The audit routing of the instance that owns the call, once the transport knows it (a
+    /// recovery writes its audit events to that instance's journal).
+    pub audit: Option<sutra_channels::TransportAuditContext>,
     pub tenant: String,
     pub module_key: String,
     pub participant_id: Option<String>,
@@ -404,7 +407,7 @@ pub struct RecordingOwner {
 /// The recordings sink: the store, the sealing key, where in-progress parts are spooled, and
 /// which recordings this process is writing.
 pub struct Recorder {
-    pub store: Arc<dyn RecordingStore>,
+    pub store: Arc<dyn ObjectStore>,
     kek: Option<Arc<Kek>>,
     key_id: String,
     pub max_seconds: u64,
@@ -420,6 +423,8 @@ pub struct Recorder {
     boot: String,
     /// The keys of the recordings this run is writing.
     live: Mutex<HashSet<String>>,
+    /// Where recovery events go.
+    audit: crate::audit::AuditJournal,
 }
 
 /// How a recording ended.
@@ -465,6 +470,27 @@ fn safe_segment(s: &str) -> String {
         .collect()
 }
 
+/// One small object written whole (a meeting segment's audio, one sampled frame).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMedia {
+    /// The key relative to the store's prefix.
+    pub key: String,
+    pub uri: String,
+    /// The SHA-256 of the stored object (what a media reference names).
+    pub sha256: String,
+    pub bytes: u64,
+    /// Sealed with the engine's single-shot sealed-object format (`SUTRA-SEALED-1`), which an
+    /// `llm` channel's `media-store` opens with the same key-encryption key.
+    pub sealed: bool,
+}
+
+/// `<module path>/<segments…>.<extension>` (each part made safe for an object key).
+pub fn media_key(module_key: &str, segments: &[&str], extension: &str) -> String {
+    let module_path: Vec<String> = module_key.split('/').map(safe_segment).collect();
+    let name: Vec<String> = segments.iter().map(|s| safe_segment(s)).collect();
+    format!("{}/{}.{extension}", module_path.join("/"), name.join("/"))
+}
+
 /// `<module path>/<segments…>.wav` (each part made safe for an object key).
 pub fn recording_base_key(module_key: &str, segments: &[&str]) -> String {
     let module_path: Vec<String> = module_key.split('/').map(safe_segment).collect();
@@ -478,24 +504,23 @@ impl Recorder {
         settings: &crate::config::RecordingSettings,
     ) -> Result<Recorder, ObjectStoreError> {
         let memory = settings.store.scheme == "memory";
-        let store: Arc<dyn RecordingStore> = if memory {
-            Arc::new(crate::store::MemoryRecordingStore::new(
+        let store: Arc<dyn ObjectStore> = if memory {
+            Arc::new(sutra_objectstore::MemoryObjectStore::new(
                 settings.store.clone(),
             ))
         } else {
-            Arc::new(crate::store::S3RecordingStore::new(
-                crate::store::S3Settings {
-                    location: settings.store.clone(),
-                    endpoint: settings.endpoint.clone(),
-                    region: settings.region.clone(),
-                    credentials: sutra_objectstore::sigv4::Credentials {
-                        access_key: settings.access_key.clone().unwrap_or_default(),
-                        secret_key: settings.secret_key.clone().unwrap_or_default(),
-                        session_token: None,
-                    },
-                    timeout: Duration::from_secs(60),
+            let mut config = sutra_objectstore::S3Config::new(
+                settings.store.clone(),
+                &settings.region,
+                sutra_objectstore::sigv4::Credentials {
+                    access_key: settings.access_key.clone().unwrap_or_default(),
+                    secret_key: settings.secret_key.clone().unwrap_or_default(),
+                    session_token: None,
                 },
-            )?)
+            );
+            config.endpoint = settings.endpoint.clone();
+            config.timeout = Duration::from_secs(60);
+            Arc::new(sutra_objectstore::S3ObjectStore::new(config)?)
         };
         let recorder = Recorder::new(
             store,
@@ -512,7 +537,7 @@ impl Recorder {
     }
 
     pub fn new(
-        store: Arc<dyn RecordingStore>,
+        store: Arc<dyn ObjectStore>,
         kek_secret: Option<&str>,
         key_id: &str,
         max_seconds: u64,
@@ -534,7 +559,18 @@ impl Recorder {
             owner,
             boot: uuid::Uuid::new_v4().simple().to_string(),
             live: Mutex::new(HashSet::new()),
+            audit: crate::audit::AuditJournal::process_wide(),
         }
+    }
+
+    /// Write recovery events to `audit` instead of the engine's journal (tests).
+    pub fn with_audit(mut self, audit: crate::audit::AuditJournal) -> Recorder {
+        self.audit = audit;
+        self
+    }
+
+    pub fn audit(&self) -> &crate::audit::AuditJournal {
+        &self.audit
     }
 
     /// Spool in-progress parts under `dir` (created when missing); without one they are held in
@@ -589,6 +625,50 @@ impl Recorder {
         self.live().len()
     }
 
+    /// Write `body` whole under `<module path>/<segments…>.<extension>[.sealed]`: sealed (the
+    /// engine's single-shot sealed-object format, bound to the full object key) when recordings
+    /// are, as is otherwise.
+    pub async fn put_media(
+        &self,
+        module_key: &str,
+        segments: &[&str],
+        extension: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<StoredMedia, String> {
+        let base = media_key(module_key, segments, extension);
+        let (key, stored_type) = match &self.kek {
+            Some(_) => (
+                format!("{base}{}", sutra_objectstore::sealed::SEALED_EXTENSION),
+                sutra_objectstore::sealed::SEALED_CONTENT_TYPE,
+            ),
+            None => (base, content_type),
+        };
+        let full = self.store.full_key(&key);
+        if !sutra_objectstore::valid_key(&full) {
+            return Err(format!("'{full}' is not an object key"));
+        }
+        let object = match &self.kek {
+            Some(kek) => {
+                sutra_objectstore::sealed::seal(kek, &self.key_id, &full, content_type, &body)?
+            }
+            None => body,
+        };
+        let store = Arc::clone(&self.store);
+        let stored = retried("segment", &key, || {
+            store.put(&key, object.clone(), stored_type)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(StoredMedia {
+            uri: stored.uri,
+            sha256: stored.sha256,
+            bytes: stored.bytes,
+            sealed: self.kek.is_some(),
+            key,
+        })
+    }
+
     /// Start a recording at `<module path>/<segments…>.wav[.sealed]` of mono PCM16 at `rate`.
     pub fn begin(
         self: &Arc<Self>,
@@ -606,7 +686,7 @@ impl Recorder {
             None => (base, RECORDING_FORMAT),
         };
         let full = self.store.full_key(&key);
-        if !crate::store::valid_key(&full) {
+        if !sutra_objectstore::valid_key(&full) {
             return Err(format!("'{full}' is not an object key"));
         }
         let wav_header = wav_streaming_header(rate);
@@ -630,6 +710,7 @@ impl Recorder {
             "moduleKey": owner.module_key,
             "participantId": owner.participant_id,
             "participantIndex": owner.participant_index,
+            "audit": owner.audit.as_ref().map(crate::audit::context_to_json),
             "rate": rate,
             "sealed": self.kek.is_some(),
             "keyId": self.kek.as_ref().map(|_| self.key_id.clone()),
@@ -695,6 +776,8 @@ pub struct WriterStats {
 
 enum UploadCommand {
     Bytes(Vec<u8>),
+    /// The audit routing of the call's instance became known: kept in the manifest.
+    Audit(sutra_channels::TransportAuditContext),
     Finish(oneshot::Sender<Result<FinishedRecording, String>>),
 }
 
@@ -747,6 +830,12 @@ impl RecordingWriter {
     /// Samples held before sealing (memory on the audio side).
     pub fn pending_samples(&self) -> usize {
         self.pending.len() + self.overlay.len()
+    }
+
+    /// The audit routing of the instance that owns the call (kept in the manifest, so a
+    /// recovery after a restart writes to that instance's journal).
+    pub fn set_audit_context(&self, context: &sutra_channels::TransportAuditContext) {
+        let _ = self.tx.send(UploadCommand::Audit(context.clone()));
     }
 
     fn send(&self, bytes: Vec<u8>) -> Result<(), String> {
@@ -882,7 +971,7 @@ struct SpoolPaths {
 
 impl SpoolPaths {
     fn of(dir: &Path, key: &str) -> SpoolPaths {
-        let name = &crate::store::sha256_hex(key.as_bytes())[..32];
+        let name = &sutra_objectstore::sha256_hex(key.as_bytes())[..32];
         SpoolPaths {
             data: dir.join(format!("{name}.spool")),
             meta: dir.join(format!("{name}.json")),
@@ -1077,6 +1166,16 @@ impl Uploader {
                         tracing::warn!(key = %self.key, "voip: a recording part could not be uploaded yet: {e}");
                     }
                 }
+                UploadCommand::Audit(context) => {
+                    let value = crate::audit::context_to_json(&context);
+                    if self.manifest["audit"] != value {
+                        self.manifest["audit"] = value;
+                        self.write_meta().await;
+                        if self.upload_id.is_some() {
+                            self.put_manifest().await;
+                        }
+                    }
+                }
                 UploadCommand::Finish(done) => {
                     let outcome = self.complete().await;
                     self.recorder.live().remove(&self.key);
@@ -1187,8 +1286,8 @@ impl Recorder {
         }
         // 2. Uploads in the store nobody is writing (another host's, or one whose spool is gone),
         // found through their markers.
-        let markers = match self.store.list_keys(UPLOAD_MARKERS).await {
-            Ok(markers) => markers,
+        let markers = match self.store.list_objects(UPLOAD_MARKERS).await {
+            Ok(markers) => markers.into_iter().map(|m| m.key).collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!("voip: the recording sweep could not list uploads: {e}");
                 return recovered;
@@ -1315,6 +1414,7 @@ impl Recorder {
         }
         let owner = RecordingOwner {
             call_id: manifest["callId"].as_str().unwrap_or_default().to_string(),
+            audit: crate::audit::context_from_json(&manifest["audit"]),
             tenant: manifest["tenant"].as_str().unwrap_or_default().to_string(),
             module_key: manifest["moduleKey"]
                 .as_str()
@@ -1339,7 +1439,8 @@ impl Recorder {
                 )
                 .await;
             let _ = store.delete(&upload_marker(&key)).await;
-            tracing::warn!(target: "sutra.audit", event = "VOIP_RECORDING_RECOVERED", call_id = %owner.call_id, key = %key, captured_ms = 0u64, "voip: an interrupted recording held no audio; its upload was aborted");
+            tracing::warn!(call_id = %owner.call_id, key = %key, "voip: an interrupted recording held no audio; its upload was aborted");
+            self.audit_recovered(&owner, &key, 0, false);
             return Ok(None);
         }
         store.complete_upload(&key, &upload_id, &contiguous).await?;
@@ -1361,7 +1462,8 @@ impl Recorder {
             )
             .await;
         let _ = store.delete(&upload_marker(&key)).await;
-        tracing::warn!(target: "sutra.audit", event = "VOIP_RECORDING_RECOVERED", call_id = %owner.call_id, key = %key, captured_ms = duration_ms, complete, "voip: an interrupted recording was recovered");
+        tracing::warn!(call_id = %owner.call_id, key = %key, captured_ms = duration_ms, complete, "voip: an interrupted recording was recovered");
+        self.audit_recovered(&owner, &key, duration_ms, complete);
         let mut reference = json!({
             "kind": crate::listen::MEDIA_REFERENCE_KIND,
             "uri": store.uri_of(&key),
@@ -1388,6 +1490,20 @@ impl Recorder {
             hangup_delivered,
             key,
         }))
+    }
+
+    /// The `voip.RECORDING_RECOVERED` event of a recovery: to the owning instance's journal when
+    /// the manifest kept its routing, else to the deployment's.
+    fn audit_recovered(&self, owner: &RecordingOwner, key: &str, captured_ms: u64, complete: bool) {
+        self.audit.append(
+            crate::audit::scope_of(owner.audit.as_ref(), Some(&owner.module_key)),
+            crate::audit::event(crate::audit::events::RECORDING_RECOVERED)
+                .with_field("callId", owner.call_id.clone())
+                .with_field("key", key.to_string())
+                .with_field("capturedMs", captured_ms)
+                .with_field("complete", complete)
+                .with_diagnostic_code(crate::codes::RECORDING_RECOVERED),
+        );
     }
 
     /// The stored object's SHA-256, size, verified audio bytes, and whether its end verified.

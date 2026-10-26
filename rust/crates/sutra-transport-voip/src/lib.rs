@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod audit;
 pub mod binding;
 pub mod config;
 pub mod features;
@@ -41,7 +42,6 @@ pub mod policy;
 pub mod protocol;
 pub mod recording;
 pub mod rustpbx;
-pub mod store;
 pub mod tokens;
 pub mod vad;
 
@@ -94,6 +94,8 @@ pub mod codes {
     pub const ORIGINATE_REFUSED: &str = "SUTRA.VOIP.ORIGINATE_REFUSED";
     /// An originate over a rate limit ([`crate::policy`]); retryable.
     pub const ORIGINATE_RATE_LIMITED: &str = "SUTRA.VOIP.ORIGINATE_RATE_LIMITED";
+    /// An interrupted recording the sweep recovered ([`crate::recording::Recorder::sweep`]).
+    pub const RECORDING_RECOVERED: &str = "SUTRA.VOIP.RECORDING_RECOVERED";
 }
 
 /// The hub the outbound sink and inline caller reach (they are built by fn-pointer hooks with
@@ -286,6 +288,13 @@ impl MessageSink for VoipSink {
         true
     }
 
+    /// Refusals, rate limits, recording recoveries and consent refusals are written to the
+    /// instance's audit journal ([`sutra_channels::transport_audit`]), so the engine stamps the
+    /// journal identity headers onto every message this scheme receives.
+    fn writes_audit_events(&self) -> bool {
+        true
+    }
+
     fn send<'a>(&'a self, message: &'a OutboundMessage) -> BoxFuture<'a, SendOutcome> {
         Box::pin(async move {
             match operate(message, false).await {
@@ -306,6 +315,13 @@ impl InlineCaller for VoipInlineCaller {
     }
 
     fn records_media(&self) -> bool {
+        true
+    }
+
+    /// Refusals, rate limits, recording recoveries and consent refusals are written to the
+    /// instance's audit journal ([`sutra_channels::transport_audit`]), so the engine stamps the
+    /// journal identity headers onto every message this scheme receives.
+    fn writes_audit_events(&self) -> bool {
         true
     }
 

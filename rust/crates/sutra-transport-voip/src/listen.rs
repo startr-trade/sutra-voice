@@ -123,7 +123,9 @@ impl ListenState {
 
     fn keep(&mut self, samples: &[i16]) {
         self.tap.extend_from_slice(samples);
-        if self.tap.len() > self.window_samples {
+        // Trimmed back to the window once it is an eighth over, so the move is amortised: the
+        // tap never holds more than 9/8 of the window.
+        if self.tap.len() > self.window_samples + self.window_samples / 8 {
             let drop = self.tap.len() - self.window_samples;
             self.tap.drain(..drop);
             self.tap_base += drop as u64;

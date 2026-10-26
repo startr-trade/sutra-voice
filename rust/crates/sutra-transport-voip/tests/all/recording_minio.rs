@@ -2,90 +2,36 @@
 //! than a part streams as a multipart upload; a recording cut by a crash is recovered — from
 //! the spool on the same host, and from the uploaded parts alone on another.
 
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sutra_objectstore::{ObjectStore, S3Config, S3ObjectStore, StoreLocation};
+use sutra_testkit::minio::{MinioContainer, MINIO_ACCESS_KEY, MINIO_REGION, MINIO_SECRET_KEY};
 use sutra_transport_voip::audio::wav_unwrap;
 use sutra_transport_voip::recording::{
     open_stream, Recorder, RecordingOwner, DEFAULT_PART_BYTES, MANIFEST_EXTENSION, UPLOAD_MARKERS,
 };
-use sutra_transport_voip::store::{RecordingStore, S3RecordingStore, S3Settings, StoreLocation};
 
-/// MinIO as built by the community, pinned by digest (the engine's meeting suites use the same).
-const MINIO: &str =
-    "pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372";
-const ACCESS: &str = "recordings-test";
-const SECRET: &str = "recordings-test-secret";
 const KEK: &str = "a test key-encryption secret";
 const RATE: u32 = 16_000;
 
-/// A container removed when the test ends, however it ends.
-struct Container(String);
-
-impl Drop for Container {
-    fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
-    }
-}
-
-fn docker(args: &[&str]) -> String {
-    let out = Command::new("docker")
-        .args(args)
-        .output()
-        .expect("docker runs");
-    assert!(
-        out.status.success(),
-        "docker {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
+/// The engine's MinIO fixture (removed when the handle drops) and an S3 client of it.
+async fn minio() -> (MinioContainer, Arc<S3ObjectStore>) {
+    let container = tokio::task::spawn_blocking(MinioContainer::start)
+        .await
+        .expect("MinIO starts");
+    let mut config = S3Config::new(
+        StoreLocation::parse("s3://call-recordings/calls").unwrap(),
+        MINIO_REGION,
+        sutra_objectstore::sigv4::Credentials {
+            access_key: MINIO_ACCESS_KEY.into(),
+            secret_key: MINIO_SECRET_KEY.into(),
+            session_token: None,
+        },
     );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-async fn minio() -> (Container, Arc<S3RecordingStore>) {
-    let name = format!(
-        "sutra-voip-recording-minio-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    );
-    docker(&[
-        "run",
-        "-d",
-        "--name",
-        &name,
-        "-p",
-        "127.0.0.1::9000",
-        "-e",
-        &format!("MINIO_ROOT_USER={ACCESS}"),
-        "-e",
-        &format!("MINIO_ROOT_PASSWORD={SECRET}"),
-        MINIO,
-        "server",
-        "/data",
-    ]);
-    let container = Container(name.clone());
-    let port = docker(&["port", &name, "9000/tcp"])
-        .lines()
-        .next()
-        .and_then(|l| l.rsplit(':').next())
-        .and_then(|p| p.trim().parse::<u16>().ok())
-        .expect("the store's host port");
-    let store = Arc::new(
-        S3RecordingStore::new(S3Settings {
-            location: StoreLocation::parse("s3://call-recordings/calls").unwrap(),
-            endpoint: Some(format!("http://127.0.0.1:{port}")),
-            region: "us-east-1".into(),
-            credentials: sutra_objectstore::sigv4::Credentials {
-                access_key: ACCESS.into(),
-                secret_key: SECRET.into(),
-                session_token: None,
-            },
-            timeout: Duration::from_secs(30),
-        })
-        .unwrap(),
-    );
+    config.endpoint = Some(container.endpoint().to_string());
+    config.timeout = Duration::from_secs(30);
+    let store = Arc::new(S3ObjectStore::new(config).unwrap());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         match store.ensure_bucket().await {
@@ -101,13 +47,13 @@ async fn minio() -> (Container, Arc<S3RecordingStore>) {
 }
 
 fn recorder(
-    store: &Arc<S3RecordingStore>,
+    store: &Arc<S3ObjectStore>,
     owner: &str,
     spool: Option<std::path::PathBuf>,
 ) -> Arc<Recorder> {
     Arc::new(
         Recorder::new(
-            Arc::clone(store) as Arc<dyn RecordingStore>,
+            Arc::clone(store) as Arc<dyn ObjectStore>,
             Some(KEK),
             "rec-key",
             7200,
@@ -124,6 +70,7 @@ fn owner(call_id: &str) -> RecordingOwner {
         module_key: "acme/calls/1.0.0".into(),
         participant_id: None,
         participant_index: None,
+        audit: None,
     }
 }
 
@@ -172,15 +119,12 @@ async fn a_recording_streams_as_a_multipart_upload_and_a_crash_is_recovered() {
     );
     let key = "acme/calls/1.0.0/whole-1.wav.sealed";
     let object = store.get(key).await.unwrap().expect("stored");
-    assert_eq!(
-        stored.sha256,
-        sutra_transport_voip::store::sha256_hex(&object)
-    );
+    assert_eq!(stored.sha256, sutra_objectstore::sha256_hex(&object));
     let opened = open_stream(&kek, &format!("calls/{key}"), &object).unwrap();
     assert!(opened.complete);
     let (samples, rate) = wav_unwrap(&opened.plaintext).unwrap();
     assert_eq!((samples.len() as u64, rate), (360 * RATE as u64, RATE));
-    assert!(store.list_keys(UPLOAD_MARKERS).await.unwrap().is_empty());
+    assert!(store.list_objects(UPLOAD_MARKERS).await.unwrap().is_empty());
 
     // 2. A crash after 4 minutes (one part uploaded, the rest spooled); the same host restarts.
     let mut writer = live
@@ -193,7 +137,7 @@ async fn a_recording_streams_as_a_multipart_upload_and_a_crash_is_recovered() {
     while live.live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(store.list_keys(UPLOAD_MARKERS).await.unwrap().len(), 1);
+    assert_eq!(store.list_objects(UPLOAD_MARKERS).await.unwrap().len(), 1);
     let restarted = recorder(&store, "host-a", Some(dir.clone()));
     let recovered = restarted.sweep().await;
     assert_eq!(recovered.len(), 1);
@@ -211,10 +155,7 @@ async fn a_recording_streams_as_a_multipart_upload_and_a_crash_is_recovered() {
     );
     let key = "acme/calls/1.0.0/cut-1.wav.sealed";
     let object = store.get(key).await.unwrap().expect("completed");
-    assert_eq!(
-        reference["sha256"],
-        sutra_transport_voip::store::sha256_hex(&object)
-    );
+    assert_eq!(reference["sha256"], sutra_objectstore::sha256_hex(&object));
     let opened = open_stream(&kek, &format!("calls/{key}"), &object).unwrap();
     assert!(!opened.complete);
     let manifest: serde_json::Value = serde_json::from_slice(
@@ -246,6 +187,6 @@ async fn a_recording_streams_as_a_multipart_upload_and_a_crash_is_recovered() {
     let duration = recovered[0].reference["durationMs"].as_u64().unwrap();
     // One whole part's worth of audio (5 MiB, less the framing): about 163 s.
     assert!((150_000..240_000).contains(&duration), "{duration}");
-    assert!(store.list_keys(UPLOAD_MARKERS).await.unwrap().is_empty());
+    assert!(store.list_objects(UPLOAD_MARKERS).await.unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -5,12 +5,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sutra_objectstore::{MemoryObjectStore, ObjectStore, StoreLocation};
 use sutra_transport_voip::audio::wav_unwrap;
 use sutra_transport_voip::config::route_set_of;
 use sutra_transport_voip::gateway::{GatewayControl, GenericGateway};
 use sutra_transport_voip::hub::VoipHub;
 use sutra_transport_voip::recording::{open_stream, Recorder, RecordingOwner, MANIFEST_EXTENSION};
-use sutra_transport_voip::store::{MemoryRecordingStore, RecordingStore, StoreLocation};
 
 use super::support::*;
 
@@ -19,14 +19,14 @@ const RATE: u32 = 8000;
 /// Small parts, so a test-sized call spans many of them (an S3 store needs 5 MiB).
 const PART: usize = 64 * 1024;
 
-fn store() -> MemoryRecordingStore {
-    MemoryRecordingStore::new(StoreLocation::parse("memory://recordings/calls").unwrap())
+fn store() -> MemoryObjectStore {
+    MemoryObjectStore::new(StoreLocation::parse("memory://recordings/calls").unwrap())
 }
 
-fn recorder(store: &MemoryRecordingStore, spool: Option<std::path::PathBuf>) -> Arc<Recorder> {
+fn recorder(store: &MemoryObjectStore, spool: Option<std::path::PathBuf>) -> Arc<Recorder> {
     Arc::new(
         Recorder::new(
-            Arc::new(store.clone()) as Arc<dyn RecordingStore>,
+            Arc::new(store.clone()) as Arc<dyn ObjectStore>,
             Some(KEK),
             "rec-key",
             7200,
@@ -45,6 +45,7 @@ fn owner(call_id: &str) -> RecordingOwner {
         module_key: "acme/billing/1.0.0".to_string(),
         participant_id: None,
         participant_index: None,
+        audit: None,
     }
 }
 
@@ -108,16 +109,13 @@ async fn a_long_call_streams_in_parts_and_memory_stays_bounded() {
         peak <= PART + 2 * (chunk * 2 + 64),
         "the store side held {peak} bytes"
     );
-    assert_eq!(store.pending_uploads(), 0);
+    assert_eq!(store.pending_upload_count(), 0);
     assert_eq!(recorder.live_count(), 0);
 
     // The stored object verifies end to end, and is the call.
     let key = "acme/billing/1.0.0/long-1.wav.sealed";
     let object = store.get(key).await.unwrap().unwrap();
-    assert_eq!(
-        stored.sha256,
-        sutra_transport_voip::store::sha256_hex(&object)
-    );
+    assert_eq!(stored.sha256, sutra_objectstore::sha256_hex(&object));
     let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
     let opened = open_stream(&kek, &format!("calls/{key}"), &object).unwrap();
     assert!(opened.complete);
@@ -176,7 +174,11 @@ async fn a_recording_cut_by_a_crash_is_recovered_amended_and_delivered_once() {
     while crashed.live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(store.pending_uploads(), 1, "the upload is left in progress");
+    assert_eq!(
+        store.pending_upload_count(),
+        1,
+        "the upload is left in progress"
+    );
 
     // The next run of the same host.
     let (intake, mut rx) = FakeIntake::new();
@@ -203,10 +205,7 @@ async fn a_recording_cut_by_a_crash_is_recovered_amended_and_delivered_once() {
 
     let key = "acme/billing/1.0.0/cut-1.wav.sealed";
     let object = store.get(key).await.unwrap().expect("completed");
-    assert_eq!(
-        reference["sha256"],
-        sutra_transport_voip::store::sha256_hex(&object)
-    );
+    assert_eq!(reference["sha256"], sutra_objectstore::sha256_hex(&object));
     let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
     let opened = open_stream(&kek, &format!("calls/{key}"), &object).unwrap();
     assert!(!opened.complete, "no final frame: it reads as cut short");
@@ -226,7 +225,7 @@ async fn a_recording_cut_by_a_crash_is_recovered_amended_and_delivered_once() {
     assert_eq!(manifest["complete"], false);
     assert_eq!(manifest["durationMs"], duration);
     assert_eq!(manifest["hangupDelivered"], true);
-    assert_eq!(store.pending_uploads(), 0);
+    assert_eq!(store.pending_upload_count(), 0);
     assert!(std::fs::read_dir(&spool).unwrap().next().is_none());
 
     // A second sweep finds nothing, and delivers nothing.
@@ -256,7 +255,7 @@ async fn the_sweep_leaves_live_and_foreign_recordings_alone() {
     );
     let other_host = Arc::new(
         Recorder::new(
-            Arc::new(store.clone()) as Arc<dyn RecordingStore>,
+            Arc::new(store.clone()) as Arc<dyn ObjectStore>,
             Some(KEK),
             "rec-key",
             7200,

@@ -4,6 +4,7 @@ mod all {
     pub mod support;
 
     mod audio_codecs;
+    mod audit_events;
     mod binding_precedence;
     mod features_synthetic;
     mod listen_calls;

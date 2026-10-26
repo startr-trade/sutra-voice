@@ -13,6 +13,7 @@ use sutra_llm_spi::{
     AudioSession, AudioSessionConfig, AudioSessionEvent, BoxFuture, Diagnostic, LlmFailure,
     LlmProvider, LlmProviderConfig, LlmProviderFactory, LlmRequest, LlmResponse,
 };
+use sutra_objectstore::{MemoryObjectStore, ObjectStore, StoreLocation};
 use sutra_transport_voip::audio::{pcm16_to_le, wav_unwrap, wav_wrap};
 use sutra_transport_voip::config::{route_set_of, RecordingSettings, VoipConfig};
 use sutra_transport_voip::gateway::{GatewayControl, GatewayError, GatewayEvent, OriginateRequest};
@@ -20,7 +21,6 @@ use sutra_transport_voip::hub::{OpError, VoipHub};
 use sutra_transport_voip::listen::Recorder;
 use sutra_transport_voip::media::media_router;
 use sutra_transport_voip::recording::{open_stream, SEALED_STREAM_CONTENT_TYPE};
-use sutra_transport_voip::store::{MemoryRecordingStore, RecordingStore, StoreLocation};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -227,7 +227,7 @@ struct Rig {
     addr: std::net::SocketAddr,
     rx: mpsc::UnboundedReceiver<sutra_channels::InboundMessage>,
     gateway: Arc<ScriptedGateway>,
-    store: MemoryRecordingStore,
+    store: MemoryObjectStore,
 }
 
 async fn rig(with_recorder: bool) -> Rig {
@@ -236,11 +236,10 @@ async fn rig(with_recorder: bool) -> Rig {
     publish_llm_channels(&defs);
     let routes = route_set_of(&defs).unwrap();
     let gateway = Arc::new(ScriptedGateway::default());
-    let store =
-        MemoryRecordingStore::new(StoreLocation::parse("memory://recordings/calls").unwrap());
+    let store = MemoryObjectStore::new(StoreLocation::parse("memory://recordings/calls").unwrap());
     let recorder = with_recorder.then(|| {
         Arc::new(Recorder::new(
-            Arc::new(store.clone()) as Arc<dyn RecordingStore>,
+            Arc::new(store.clone()) as Arc<dyn ObjectStore>,
             Some(KEK),
             "rec-key",
             60,
@@ -440,6 +439,128 @@ async fn a_listen_only_call_is_recorded_sealed_transcribed_and_reported_at_the_h
     while let Ok(message) = rig.rx.try_recv() {
         assert_ne!(message.channel, "turn");
     }
+}
+
+/// An originated call the process marked `capture=media`, asking `record: after-consent`: the
+/// recording starts only once the consent announcement has played to the end — the audio before
+/// it, and the announcement itself, are not in it. Hung up before consent, nothing is recorded.
+#[tokio::test]
+async fn an_originated_after_consent_call_records_only_once_the_announcement_has_played() {
+    let mut rig = rig(true).await;
+    let originate = |call_id: &str| {
+        let mut message = outbound(
+            "voip://originate",
+            None,
+            &serde_json::json!({"callId": call_id, "destination": "sip:+15550100@trunk",
+                                "mode": "listen", "record": "after-consent"})
+            .to_string(),
+            "application/json",
+        );
+        message
+            .headers
+            .insert("sutra-audit-capture".to_string(), "media".to_string());
+        message
+    };
+    let speak = |ms: u32| -> Vec<Message> {
+        tone(220.0, ms, 8000, 9000.0)
+            .chunks(160)
+            .map(|frame| Message::binary(pcm16_to_le(frame)))
+            .collect()
+    };
+
+    // Hung up before consent: nothing recorded.
+    let answer = rig
+        .hub
+        .operate(None, "originate", &originate("early-1"), true)
+        .await
+        .unwrap();
+    assert_eq!(answer["record"], "after-consent", "{answer}");
+    rig.hub.on_gateway_event(GatewayEvent::Answered {
+        call_id: "early-1".into(),
+    });
+    let url = bridge_url(&rig.hub, rig.addr, "early-1", "&samplerate=8000&codec=pcm");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    while json_of(&next_on(&mut rig.rx, "progress").await)["status"] != "connected" {}
+    for frame in speak(400) {
+        ws.send(frame).await.unwrap();
+    }
+    rig.hub.on_gateway_event(GatewayEvent::Hangup {
+        call_id: "early-1".into(),
+        reason: Some("bye".into()),
+        hangup_by: Some("callee".into()),
+        sip_status: None,
+    });
+    let ended = json_of(&next_on(&mut rig.rx, "hangup").await);
+    assert_eq!(ended["recording"]["status"], "not-started", "{ended}");
+    assert!(rig.store.keys().iter().all(|k| !k.contains("early-1")));
+
+    // Consent given: the recording begins where the announcement ended.
+    rig.hub
+        .operate(None, "originate", &originate("late-1"), true)
+        .await
+        .unwrap();
+    rig.hub.on_gateway_event(GatewayEvent::Answered {
+        call_id: "late-1".into(),
+    });
+    let url = bridge_url(&rig.hub, rig.addr, "late-1", "&samplerate=8000&codec=pcm");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    while json_of(&next_on(&mut rig.rx, "progress").await)["status"] != "connected" {}
+    for frame in speak(300) {
+        ws.send(frame).await.unwrap();
+    }
+    let prompt = wav_wrap(&tone(440.0, 300, 8000, 8000.0), 8000);
+    let play = outbound(
+        "voip://play",
+        Some("late-1"),
+        &serde_json::json!({"consent": true, "audio": {
+            "data": base64::engine::general_purpose::STANDARD.encode(&prompt),
+            "format": "audio/wav"}})
+        .to_string(),
+        "application/json",
+    );
+    let played = rig.hub.operate(None, "play", &play, true).await.unwrap();
+    assert_eq!(played["interrupted"], false);
+    let mut after = silence(200, 8000);
+    after.extend(tone(220.0, 400, 8000, 9000.0));
+    for frame in after.chunks(160) {
+        ws.send(Message::binary(pcm16_to_le(frame))).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    rig.hub.on_gateway_event(GatewayEvent::Hangup {
+        call_id: "late-1".into(),
+        reason: Some("bye".into()),
+        hangup_by: Some("callee".into()),
+        sip_status: None,
+    });
+    let ended = loop {
+        let message = next_on(&mut rig.rx, "hangup").await;
+        if message.headers["x-call-id"] == "late-1" {
+            break json_of(&message);
+        }
+    };
+    let recording = &ended["recording"];
+    assert_eq!(recording["kind"], "media", "{ended}");
+    assert_eq!(recording["complete"], true);
+    assert_eq!(recording["consentAnnounced"], true);
+    assert!(
+        recording["startMs"].as_u64().unwrap() >= 250,
+        "it began after the 300 ms announcement: {recording}"
+    );
+    assert!(
+        recording["consentAnnouncedAtMs"].as_i64().unwrap() <= 0,
+        "the announcement precedes the recording: {recording}"
+    );
+    // The announcement (440 Hz at 8000) is not mixed into the recording: it ended first.
+    let key = "acme/meetings/1.0.0/late-1.wav.sealed";
+    let stored = rig.store.get(key).await.unwrap().expect("stored");
+    let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
+    let opened = open_stream(&kek, &format!("calls/{key}"), &stored).unwrap();
+    let (samples, _) = wav_unwrap(&opened.plaintext).unwrap();
+    let head = &samples[..samples.len().min(800)];
+    assert!(
+        head.iter().all(|s| s.unsigned_abs() < 4000),
+        "the recording opens after the announcement"
+    );
 }
 
 #[tokio::test]
