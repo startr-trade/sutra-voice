@@ -16,9 +16,11 @@
 #
 # THE MEDIA PLANE never reaches the flow: the transport records each participant's audio (sealed,
 # to the object store), transcribes each participant's track live (exact attribution: a segment
-# comes from one person's track), and analyses each segment of each ANALYSED participant with a
-# video-understanding model. The flow hears sparse events: the session started, someone joined
-# or left, one transcript segment, one segment analysis, the session ended.
+# comes from one person's track), and cuts the session into segments, writing each segment's
+# audio and frames to the store (sealed) and handing the flow their REFERENCES. The flow hears
+# sparse events: the session started, someone joined or left, one transcript segment, one media
+# segment, the session ended. What is analysed, with which prompt, and how the signals are fused
+# is the flows' (segment-analysis.bpmn, rules/analysis-policy.dmn).
 
 channels:
   # ---- the session ------------------------------------------------------------------------------
@@ -29,7 +31,8 @@ channels:
     bind: "number:+15550190000"       # SUTRA_WORKER_CALLED of the worker in this room
     codec: json
     mode: listen                      # nobody takes turns with a meeting
-    record: true                      # each participant's audio, sealed; the process audits media
+    record: after-consent             # each participant's audio, sealed, once the announcement
+                                      # has played (segments wait for it too)
     silence-ms: 400                   # a pause this long ends a speaker's turn (a turn boundary)
     dead-air-ms: 4000                 # nobody speaking this long is a flagged moment
     # VIDEO SAMPLING — the cost dial. Frames of every participant at this rate, plus one frame of
@@ -41,8 +44,7 @@ channels:
       quality: 70
       extra-frames: true
 
-  # { callId, event: joined|left, participantId, participantIndex, label, role, analysed,
-  #   analysisPolicy, atMs }
+  # { callId, event: joined|left, participantId, participantIndex, label, role, segmented, atMs }
   - name: call-participant
     transport: voip
     event: call-participant
@@ -66,25 +68,22 @@ channels:
       language: en
       drain-ms: 3000
 
-  # One participant over one segment: { callId, key, participantId, role, segment, startMs, endMs,
-  # speaking, talkMs, frames, audioMs, features, result: {expression, engagement, attention,
-  # bodyLanguage, emotion: {label, confidence, modalities}, disagreement, reactions}, status }
-  # -> segment-analysis. THE POLICY lives here and is enforced by the transport: only `roles` are
-  # analysed; a staff role is refused unless `allow-staff: true` (see the README — prohibited at
-  # work in the EU). A participant who is not analysed never has a frame sent to the model. The
-  # model is the `video-analysis` llm channel below.
-  - name: call-analysis
+  # One participant over one segment, as media REFERENCES: { callId, key, participantId,
+  # participant ("P<n>"), role, segment, startMs, endMs, speaking, talkMs, audioMs, features,
+  # flaggedMoments, words, present, audio: {kind: "media", uri, sha256, participant, startMs,
+  # endMs, format}, frames: [{kind: "media", uri, sha256, atMs, requested, ...}], status }
+  # -> segment-analysis, which decides, asks the `video-analysis` model and fuses. `roles` is the
+  # transport's own gate: only these roles are cut into segments, so a staff participant's media
+  # is never written as a segment at all (the flow's policy applies again on top).
+  - name: call-segment
     transport: voip
-    event: call-analysis
+    event: call-segment
     codec: json
-    analyze:
-      channel: video-analysis             # the llm channel each segment is analysed through
+    segment:
+      seconds: 5
+      max-frames: 8                       # the most frames of one participant per segment
       roles: [external]
-      allow-staff: false
-      default-role: unknown               # a participant admitted with no role is not analysed
-      segment-seconds: 5
-      when: post-call                     # or periodic: each segment as it closes
-      max-frames: 8
+      default-role: unknown               # a participant admitted with no role
 
   # ---- what the flow does to the session ---------------------------------------------------------
 
@@ -103,16 +102,15 @@ channels:
     transport: voip
     bind: "voip://hangup"
 
-  # ---- the models the transport calls ------------------------------------------------------------
+  # ---- the models ---------------------------------------------------------------------------------
 
-  # Called by the voip transport itself: the audio and the frames go from the transport to the
-  # provider and never pass through a process, so these channels answer inline
-  # (`ack-mode: on-complete`, no reply channel). The candidates are tried in order; the channel's
-  # `require:` keeps out a candidate that cannot do the job, and `fallback-on` (rate-limited,
-  # unavailable, timeout by default) moves to the next.
+  # Both answer inline (`ack-mode: on-complete`, no reply channel). The candidates are tried in
+  # order; the channel's `require:` keeps out a candidate that cannot do the job, and `fallback-on`
+  # (rate-limited, unavailable, timeout by default) moves to the next.
 
-  # Live transcription, one session per participant's track: every candidate must have live
-  # audio sessions. Each open session holds one `concurrency` permit (one per participant).
+  # Live transcription, called by the voip transport itself (the audio goes from the transport to
+  # the provider), one session per participant's track: every candidate must have live audio
+  # sessions. Each open session holds one `concurrency` permit (one per participant).
   - name: meeting-transcription
     direction: outbound
     transport: llm
@@ -128,15 +126,20 @@ channels:
           base-url: http://model-stub:8000/v1
           api-key: env:LLM_API_KEY
 
-  # Per-segment analysis: every candidate must read video. The segment's audio goes too, to a
-  # candidate that takes audio (one that cannot is skipped for that call — audio is never
-  # silently dropped). `timeout-seconds` bounds one model call.
+  # Per-segment analysis, called by segment-analysis.bpmn with the segment's media as {ref, sha256}
+  # parts: `media-store` names the engine's object store (sutra.object-stores.recordings, the
+  # bucket the transport writes to) the channel reads each object from, checks its digest and
+  # size, and opens (sealed objects, under the same key-encryption key). Every candidate must read
+  # video; the segment's audio goes to a candidate that takes audio (one that cannot is skipped for
+  # that call: audio is never silently dropped). `timeout-seconds` bounds one model call.
   - name: video-analysis
     direction: outbound
     transport: llm
     bind: "llm://video-analysis"
     ack-mode: on-complete
     llm:
+      media-store: recordings
+      media-max-bytes: 4194304            # a 5 s segment at 16 kHz is ~160 KB; a frame far less
       require: [video-understanding]
       timeout-seconds: 60
       concurrency: 4

@@ -8,27 +8,34 @@
       -> the consent announcement, SPOKEN in the room by the bot (recording and analysis)
       -> ONE event-based gateway, looped: a participant joined or left (the roster),
          the session ended (call-hangup), or a 4-hour limit (leave)
-      -> after the session: the record (participants, roles, who was analysed and why, talk time,
-         each participant's recording REFERENCE, the analysis digest) rendered as a report
-         (session-report.hbs) and stored (meetings, "session:<callId>").
+      -> after the session: the analysis rows read back (one per participant and segment), the
+         digest computed here (FEEL: the dominant emotion and engagement, disagreements), the
+         record (participants, roles, who was analysed and why, talk time, each participant's
+         recording REFERENCE, the digest) rendered as a report (session-report.hbs) and stored
+         (meetings, "session:<callId>").
 
   THE MEDIA PLANE never passes through this flow. The `voip` transport records each participant's
   audio (sealed, to the object store; the hang-up carries only the REFERENCES), transcribes each
-  participant's own track (transcript-segment.bpmn stores every segment) and analyses each segment
-  of each analysed participant from its audio and sampled camera frames (segment-analysis.bpmn
-  stores every answer). `<q:audit capture="media">` audits those references, never media.
+  participant's own track (transcript-segment.bpmn stores every segment) and cuts the session into
+  segments, writing each segment's audio and frames to the store and delivering their references
+  on `call-segment`; segment-analysis.bpmn decides, asks the model and fuses, segment by segment.
+  `<q:audit capture="media">` audits the references, never media.
 
-  WHO IS ANALYSED is decided by the `call-analysis` channel and enforced in the transport, before
-  any frame reaches a model: the role a participant was admitted with (a room-token attribute,
-  never inferred), `external` by default; staff only with an explicit opt-in (see the README: in
-  the EU, emotion recognition at work is prohibited). Analysis is advisory — for people to read.
+  WHO IS ANALYSED is decided in the flows, by rules/analysis-policy.dmn: the role a participant
+  was admitted with (a room-token attribute, never inferred), external parties yes, staff only with
+  this deployment's switch (`allowStaff`, false as shipped) AND an opt-in (see the README: in the
+  EU, emotion recognition at work is prohibited). The transport adds a first gate of its own: the
+  `call-segment` channel cuts only the roles it lists, so a staff participant's media is never
+  even written as a segment. Analysis is advisory, for people to read.
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                   xmlns:q="urn:sutra:q:1.0"
                   id="Definitions_video_meeting"
                   targetNamespace="urn:sutra:module:video-meeting-assistant:1.0.0">
 
   <bpmn:dataStore id="meetingsStore" name="meetings"/>
+  <bpmn:dataStore id="analysisStore" name="analysis"/>
 
   <bpmn:process id="video-meeting" name="Sit in on, record and analyse a video meeting" isExecutable="true">
     <bpmn:extensionElements>
@@ -40,6 +47,10 @@
     </bpmn:extensionElements>
 
     <bpmn:dataObject id="doRecord" name="record"/>
+    <bpmn:dataObject id="doAnalysisRow" name="analysisRow"/>
+    <bpmn:dataStoreReference id="dsrAnalysis" name="analysis" dataStoreRef="analysisStore">
+      <bpmn:extensionElements><q:store key="analysisKey"/></bpmn:extensionElements>
+    </bpmn:dataStoreReference>
     <bpmn:dataStoreReference id="dsrRecord" name="meetings" dataStoreRef="meetingsStore">
       <bpmn:extensionElements><q:store key="&quot;session:&quot; + callId"/></bpmn:extensionElements>
     </bpmn:dataStoreReference>
@@ -93,15 +104,15 @@
     <bpmn:sequenceFlow id="F_to_participant" sourceRef="InMeeting" targetRef="Roster"/>
     <bpmn:sequenceFlow id="F_to_ended" sourceRef="InMeeting" targetRef="SessionEnded"/>
     <bpmn:sequenceFlow id="F_to_too_long" sourceRef="InMeeting" targetRef="TooLong"/>
-    <!-- { callId, event: joined|left, participantId, participantIndex, label, role, analysed,
-         analysisPolicy, atMs } -->
+    <!-- { callId, event: joined|left, participantId, participantIndex, label, role, segmented,
+         atMs } -->
     <bpmn:intermediateCatchEvent id="Roster" name="Someone joined or left">
       <bpmn:extensionElements><q:source channel="call-participant" name="change" dataClass="pii"/></bpmn:extensionElements>
       <bpmn:incoming>F_to_participant</bpmn:incoming><bpmn:outgoing>F_changed</bpmn:outgoing>
       <bpmn:messageEventDefinition/>
     </bpmn:intermediateCatchEvent>
     <!-- { callId, reason, durationMs, session: "meeting", consentAnnounced, participants: [...],
-         recordings: [<media reference>...], transcript, analysis, video, flaggedMoments } -->
+         recordings: [<media reference>...], transcript, segments, video, flaggedMoments } -->
     <bpmn:intermediateCatchEvent id="SessionEnded" name="The meeting ended">
       <bpmn:extensionElements><q:source channel="call-hangup" name="ended" dataClass="pii"/></bpmn:extensionElements>
       <bpmn:incoming>F_to_ended</bpmn:incoming><bpmn:outgoing>F_ended</bpmn:outgoing>
@@ -112,13 +123,29 @@
       <bpmn:timerEventDefinition><bpmn:timeDuration>PT4H</bpmn:timeDuration></bpmn:timerEventDefinition>
     </bpmn:intermediateCatchEvent>
 
-    <bpmn:serviceTask id="NoteChange" name="Note the change (FEEL)">
-      <bpmn:incoming>F_changed</bpmn:incoming><bpmn:outgoing>F_noted</bpmn:outgoing>
+    <!-- The policy segment-analysis.bpmn applies, decided here for the roster and the report:
+         who is analysed, and why not. -->
+    <bpmn:serviceTask id="PolicyInputs" name="The policy's inputs (FEEL)">
+      <bpmn:incoming>F_changed</bpmn:incoming><bpmn:outgoing>F_policy_inputs</bpmn:outgoing>
       <bpmn:dataInputAssociation>
-        <bpmn:assignment><bpmn:from>append(roster, {event: change.event, participantIndex: change.participantIndex, role: change.role, analysed: change.analysed, atMs: change.atMs})</bpmn:from><bpmn:to>roster</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>change.role</bpmn:from><bpmn:to>role</bpmn:to></bpmn:assignment>
+        <!-- THE DEPLOYMENT SWITCH: keep it equal to the one in segment-analysis.bpmn. -->
+        <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>allowStaff</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>optedIn</bpmn:to></bpmn:assignment>
       </bpmn:dataInputAssociation>
     </bpmn:serviceTask>
-    <bpmn:sequenceFlow id="F_changed" sourceRef="Roster" targetRef="NoteChange"/>
+    <bpmn:sequenceFlow id="F_changed" sourceRef="Roster" targetRef="PolicyInputs"/>
+    <bpmn:sequenceFlow id="F_policy_inputs" sourceRef="PolicyInputs" targetRef="Policy"/>
+    <bpmn:businessRuleTask id="Policy" name="Who is analysed (DMN)" implementation="analysis-policy.dmn">
+      <bpmn:incoming>F_policy_inputs</bpmn:incoming><bpmn:outgoing>F_policy</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:sequenceFlow id="F_policy" sourceRef="Policy" targetRef="NoteChange"/>
+    <bpmn:serviceTask id="NoteChange" name="Note the change (FEEL)">
+      <bpmn:incoming>F_policy</bpmn:incoming><bpmn:outgoing>F_noted</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>append(roster, {event: change.event, participantIndex: change.participantIndex, role: change.role, segmented: change.segmented, analysed: analysed, analysisPolicy: analysisPolicy, atMs: change.atMs})</bpmn:from><bpmn:to>roster</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
     <!-- THE LOOP: back to the same wait. -->
     <bpmn:sequenceFlow id="F_noted" sourceRef="NoteChange" targetRef="InMeeting"/>
 
@@ -140,23 +167,92 @@
       <bpmn:incoming>F_left</bpmn:incoming><bpmn:outgoing>F_left_ended</bpmn:outgoing>
       <bpmn:messageEventDefinition/>
     </bpmn:intermediateCatchEvent>
-    <bpmn:sequenceFlow id="F_ended" sourceRef="SessionEnded" targetRef="AfterSession"/>
-    <bpmn:sequenceFlow id="F_left_ended" sourceRef="LeftEnded" targetRef="AfterSession"/>
+    <bpmn:sequenceFlow id="F_ended" sourceRef="SessionEnded" targetRef="Settle"/>
+    <bpmn:sequenceFlow id="F_left_ended" sourceRef="LeftEnded" targetRef="Settle"/>
 
-    <!-- ---- after the session: the record and its report ---- -->
-    <bpmn:serviceTask id="AfterSession" name="The report's view (FEEL)">
+    <!-- ---- after the session: the analysis read back, the digest, the record and its report ---- -->
+
+    <!-- The last segment is delivered just before the hang-up, and its analysis (a model call)
+         may still be running: give it a moment. With a slow model, raise this. -->
+    <bpmn:intermediateCatchEvent id="Settle" name="Let the last analyses land">
       <bpmn:incoming>F_ended</bpmn:incoming>
       <bpmn:incoming>F_left_ended</bpmn:incoming>
-      <bpmn:outgoing>F_after</bpmn:outgoing>
+      <bpmn:outgoing>F_settled</bpmn:outgoing>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT5S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="F_settled" sourceRef="Settle" targetRef="PrepRead"/>
+
+    <!-- One row per segment of every segmented participant: "<callId>:<index>:<segment>". -->
+    <bpmn:serviceTask id="PrepRead" name="The rows to read (FEEL)">
+      <bpmn:incoming>F_settled</bpmn:incoming><bpmn:outgoing>F_prep_read</bpmn:outgoing>
       <bpmn:dataInputAssociation>
         <bpmn:assignment><bpmn:from>"reported"</bpmn:from><bpmn:to>status</bpmn:to></bpmn:assignment>
         <bpmn:assignment><bpmn:from>string(now())</bpmn:from><bpmn:to>endedAt</bpmn:to></bpmn:assignment>
         <bpmn:assignment>
-          <bpmn:from>for p in (if ended.participants = null then [] else ended.participants) return {participantId: p.participantId, participantIndex: p.participantIndex, label: p.label, role: p.role, analysed: p.analysed, analysisPolicy: p.analysisPolicy, talkMs: p.talkMs, transcriptLines: p.transcriptLines, frames: p.video, segments: if p.analysis = null then 0 else p.analysis.segments, emotion: if p.analysis = null then null else p.analysis.dominantEmotion, engagement: if p.analysis = null then null else p.analysis.dominantEngagement, disagreements: if p.analysis = null then 0 else p.analysis.disagreements, recordingUri: if p.recording = null then null else p.recording.uri, recordingSha256: if p.recording = null then null else p.recording.sha256}</bpmn:from>
+          <bpmn:from>flatten(for p in (if ended.participants = null then [] else ended.participants) return if p.segments = null or p.segments &lt; 1 then [] else for n in 1..p.segments return callId + ":" + string(p.participantIndex) + ":" + string(n))</bpmn:from>
+          <bpmn:to>analysisKeys</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment><bpmn:from>1</bpmn:from><bpmn:to>rowIndex</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>[]</bpmn:from><bpmn:to>rows</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_read" sourceRef="PrepRead" targetRef="MoreRows"/>
+    <bpmn:exclusiveGateway id="MoreRows" name="Another row?" default="F_all_read">
+      <bpmn:incoming>F_prep_read</bpmn:incoming>
+      <bpmn:incoming>F_collected</bpmn:incoming>
+      <bpmn:outgoing>F_read_next</bpmn:outgoing>
+      <bpmn:outgoing>F_all_read</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_read_next" name="yes" sourceRef="MoreRows" targetRef="PrepKey">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">rowIndex &lt;= count(analysisKeys)</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_all_read" sourceRef="MoreRows" targetRef="AfterSession"/>
+    <bpmn:serviceTask id="PrepKey" name="The row's key (FEEL)">
+      <bpmn:incoming>F_read_next</bpmn:incoming><bpmn:outgoing>F_prep_key</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>analysisKeys[rowIndex]</bpmn:from><bpmn:to>analysisKey</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prep_key" sourceRef="PrepKey" targetRef="ReadRow"/>
+    <bpmn:serviceTask id="ReadRow" name="Read the row">
+      <bpmn:incoming>F_prep_key</bpmn:incoming><bpmn:outgoing>F_read</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:sourceRef>dsrAnalysis</bpmn:sourceRef>
+        <bpmn:targetRef>doAnalysisRow</bpmn:targetRef>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_read" sourceRef="ReadRow" targetRef="Collect"/>
+    <bpmn:serviceTask id="Collect" name="Collect it (FEEL)">
+      <bpmn:incoming>F_read</bpmn:incoming><bpmn:outgoing>F_collected</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>if analysisRow = null then rows else append(rows, analysisRow)</bpmn:from><bpmn:to>rows</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>rowIndex + 1</bpmn:from><bpmn:to>rowIndex</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <!-- THE READ LOOP. -->
+    <bpmn:sequenceFlow id="F_collected" sourceRef="Collect" targetRef="MoreRows"/>
+
+    <!-- THE DIGEST, per participant: who was analysed and why not (the roster's decision), the
+         segments analysed, the most frequent emotion and engagement level, and how many segments
+         the signals disagreed in (counted, never averaged). -->
+    <bpmn:serviceTask id="AfterSession" name="The digest and the report's view (FEEL)">
+      <bpmn:incoming>F_all_read</bpmn:incoming>
+      <bpmn:outgoing>F_after</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>for p in (if ended.participants = null then [] else ended.participants) return {decided: (roster[item.event = "joined" and item.participantIndex = p.participantIndex])[1], mine: rows[item.participantIndex = p.participantIndex and item.status = "complete"], emotions: (for r in mine return r.result.emotion.label)[item != null], emotionCounts: for l in distinct values(emotions) return {label: l, n: count(emotions[item = l])}, topEmotion: max(for c in emotionCounts return c.n), engagements: (for r in mine return r.result.engagement)[item != null], engagementCounts: for l in distinct values(engagements) return {label: l, n: count(engagements[item = l])}, topEngagement: max(for c in engagementCounts return c.n), participantId: p.participantId, participantIndex: p.participantIndex, label: p.label, role: p.role, segmented: p.segmented, analysed: if decided = null then false else decided.analysed, analysisPolicy: if decided = null then "unknown" else decided.analysisPolicy, talkMs: p.talkMs, transcriptLines: p.transcriptLines, frames: p.video, segments: count(mine), emotion: if topEmotion = null then null else (emotionCounts[item.n = topEmotion])[1].label, engagement: if topEngagement = null then null else (engagementCounts[item.n = topEngagement])[1].label, disagreements: count(mine[item.result.disagreement.flagged = true]), recordingUri: if p.recording = null then null else p.recording.uri, recordingSha256: if p.recording = null then null else p.recording.sha256}</bpmn:from>
+          <bpmn:to>digests</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>for d in digests return {participantId: d.participantId, participantIndex: d.participantIndex, label: d.label, role: d.role, segmented: d.segmented, analysed: d.analysed, analysisPolicy: d.analysisPolicy, talkMs: d.talkMs, transcriptLines: d.transcriptLines, frames: d.frames, segments: d.segments, emotion: d.emotion, engagement: d.engagement, disagreements: d.disagreements, recordingUri: d.recordingUri, recordingSha256: d.recordingSha256}</bpmn:from>
           <bpmn:to>participants</bpmn:to>
         </bpmn:assignment>
         <bpmn:assignment>
-          <bpmn:from>{callId: callId, room: room, startedAt: startedAt, endedAt: endedAt, durationMs: ended.durationMs, consentAnnounced: ended.consentAnnounced, participants: participants, analysis: ended.analysis, transcriptSegments: ended.transcript.segments, video: ended.video}</bpmn:from>
+          <bpmn:from>{channel: "video-analysis", provider: (rows[item.provider != null])[1].provider, model: (rows[item.model != null])[1].model, segmentMs: if ended.segments = null then null else ended.segments.segmentMs, segments: if ended.segments = null then 0 else ended.segments.delivered, results: count(rows[item.status = "complete"]), failed: count(rows[item.status = "failed"]), notAnalysed: count(rows[item.status = "not-analysed"]), missing: count(analysisKeys) - count(rows)}</bpmn:from>
+          <bpmn:to>analysis</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{callId: callId, room: room, startedAt: startedAt, endedAt: endedAt, durationMs: ended.durationMs, consentAnnounced: ended.consentAnnounced, participants: participants, analysis: analysis, transcriptSegments: ended.transcript.segments, video: ended.video}</bpmn:from>
           <bpmn:to>view</bpmn:to>
         </bpmn:assignment>
       </bpmn:dataInputAssociation>
@@ -173,7 +269,7 @@
       <bpmn:incoming>F_rendered</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
       <bpmn:dataInputAssociation>
         <bpmn:assignment>
-          <bpmn:from>{callId: callId, room: room, status: "reported", startedAt: startedAt, endedAt: endedAt, endReason: ended.reason, durationMs: ended.durationMs, consentAnnounced: ended.consentAnnounced, roster: roster, participants: participants, analysis: ended.analysis, transcript: ended.transcript, video: ended.video, flaggedMoments: ended.flaggedMoments, recordings: ended.recordings, report: responseBody}</bpmn:from>
+          <bpmn:from>{callId: callId, room: room, status: "reported", startedAt: startedAt, endedAt: endedAt, endReason: ended.reason, durationMs: ended.durationMs, consentAnnounced: ended.consentAnnounced, roster: roster, participants: participants, analysis: analysis, segments: ended.segments, transcript: ended.transcript, video: ended.video, flaggedMoments: ended.flaggedMoments, recordings: ended.recordings, report: responseBody}</bpmn:from>
           <bpmn:to>record</bpmn:to>
         </bpmn:assignment>
       </bpmn:dataInputAssociation>

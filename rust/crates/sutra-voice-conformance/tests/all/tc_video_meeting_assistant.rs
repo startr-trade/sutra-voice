@@ -1,7 +1,8 @@
 //! Conformance: `examples/video-meeting-assistant` end to end — a WebRTC media worker sits in a
 //! LiveKit room as a participant and streams every other participant (audio + sampled video) to
-//! the engine on one tagged media-stream socket; the engine records, transcribes and analyses
-//! each participant separately.
+//! the engine on one tagged media-stream socket; the engine records and transcribes each
+//! participant separately and cuts each external participant's media into segments, which the
+//! flows analyse.
 //!
 //! One docker network carries the whole session:
 //!
@@ -12,17 +13,20 @@
 //! | `sutra-webrtc-worker:dev` (worker) | the bot: joins the room, streams every participant to the engine (`make worker-image`) |
 //! | `sutra-webrtc-worker:dev` (participant ×2) | scripted participants: a synthetic microphone on a talk script and a synthetic camera; one `staff`, one `external` |
 //! | MinIO (community build, pinned by digest) | the S3-compatible object store the recordings are sealed into |
-//! | the examples' stub model server | the Realtime transcription sessions (one per participant) and the native Gemini `generateContent` analysis |
+//! | the examples' stub model server | the Realtime transcription sessions (one per participant) and the native Gemini `generateContent` analysis the flow calls |
 //! | PostgreSQL | the engine's database (audit_event) and the package's stores |
 //!
 //! WHAT IS PROVEN, from one meeting: the bot joins and the session starts; both participants'
 //! streams arrive attributed to the right participant (each transcript row comes from that
 //! participant's own track, and each track got its own transcription session); frames are sampled
 //! at the configured rate (1 fps) plus extra frames at turn boundaries; one sealed recording per
-//! participant is in the bucket and its SHA-256 is the audited one; the analysis is stored per
-//! participant and segment for the external participant only — the staff participant is never
-//! analysed (no opt-in) — and the model saw the frames the transport says it sent; the consent
-//! announcement was played; the session ends cleanly (the worker exits 0).
+//! participant is in the bucket and its SHA-256 is the audited one; each segment of the external
+//! participant is written to the bucket (sealed audio and frames) and reaches the flow as media
+//! references; the flow's policy (DMN) analyses it, the model reads the media through the `llm`
+//! channel's media-store (the stub reports the frames and audio it received), and the flow keeps
+//! only the fields it asked for. The staff participant is never cut into segments and never
+//! analysed (no opt-in); the consent announcement was played before anything was recorded; the
+//! session ends cleanly (the worker exits 0).
 
 use std::process::Command;
 use std::sync::OnceLock;
@@ -258,6 +262,26 @@ fn boot() -> VideoMeeting {
         )
         .env("SUTRA_VOIP_RECORDING_KEK", "env:RECORDINGS_KEK")
         .env("SUTRA_VOIP_RECORDING_CREATE_BUCKET", "true")
+        // The same bucket as the engine's object store `recordings`: the flow's model channel
+        // reads the segments from it (`media-store: recordings`).
+        .env("SUTRA_OBJECT_STORES", "recordings")
+        .env(
+            "SUTRA_OBJECT_STORES_RECORDINGS_URI",
+            "s3://meeting-recordings/sessions",
+        )
+        .env(
+            "SUTRA_OBJECT_STORES_RECORDINGS_ENDPOINT",
+            format!("http://{store}:9000"),
+        )
+        .env(
+            "SUTRA_OBJECT_STORES_RECORDINGS_ACCESS_KEY",
+            "env:RECORDINGS_ACCESS_KEY",
+        )
+        .env(
+            "SUTRA_OBJECT_STORES_RECORDINGS_SECRET_KEY",
+            "env:RECORDINGS_SECRET_KEY",
+        )
+        .env("SUTRA_OBJECT_STORES_RECORDINGS_KEK", "env:RECORDINGS_KEK")
         .env("RECORDINGS_ACCESS_KEY", STORE_ACCESS)
         .env("RECORDINGS_SECRET_KEY", STORE_SECRET)
         .env("RECORDINGS_KEK", KEK)
@@ -430,8 +454,8 @@ fn recordings_store(m: &VideoMeeting) -> sutra_objectstore::S3ObjectStore {
 // ---- the meeting --------------------------------------------------------------------------------
 
 /// One video meeting, end to end: joined, streamed per participant, sampled, recorded per
-/// participant (sealed, audited by hash), transcribed per track, analysed per segment for the
-/// external participant only, ended cleanly.
+/// participant (sealed, audited by hash), transcribed per track, cut into segments and analysed
+/// by the flow for the external participant only, ended cleanly.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "docker"]
 async fn tc_video_meeting_assistant_streams_records_transcribes_and_analyses_per_participant() {
@@ -496,7 +520,8 @@ async fn tc_video_meeting_assistant_streams_records_transcribes_and_analyses_per
     // CONSENT: the bot announced recording and analysis in the room.
     assert_eq!(record["consentAnnounced"], true, "{record}");
 
-    // THE PARTICIPANTS: both arrived, each with its declared role; only Sam is analysed.
+    // THE PARTICIPANTS: both arrived, each with its declared role; only Sam is segmented and
+    // analysed — the flow's decision table says why not for Alex.
     let participants = record["participants"].as_array().expect("participants");
     assert_eq!(participants.len(), 2, "{record}");
     let by_label = |label: &str| {
@@ -509,8 +534,12 @@ async fn tc_video_meeting_assistant_streams_records_transcribes_and_analyses_per
     assert_eq!(p_alex["role"], "staff");
     assert_eq!(p_alex["analysed"], false);
     assert_eq!(p_alex["analysisPolicy"], "staff-not-opted-in");
+    assert_eq!(p_alex["segmented"], false);
+    assert_eq!(p_alex["segments"], 0);
     assert_eq!(p_sam["role"], "external");
     assert_eq!(p_sam["analysed"], true);
+    assert_eq!(p_sam["analysisPolicy"], "analysed");
+    assert_eq!(p_sam["segmented"], true);
     for p in [p_alex, p_sam] {
         let talk = p["talkMs"].as_u64().unwrap();
         assert!(
@@ -547,15 +576,19 @@ async fn tc_video_meeting_assistant_streams_records_transcribes_and_analyses_per
     }
     assert_eq!(rows.len(), 4, "{rows:?}");
 
-    // THE ANALYSIS: per segment, Sam only; the model saw exactly the frames the transport sent.
+    // THE ANALYSIS: per segment, Sam only, by the flow. The model read exactly the media the
+    // segment referenced (the stub reports what it received), and the flow kept only the fields
+    // it asked for (the stub's extra keys are dropped and listed).
+    let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
+    let store = recordings_store(m);
     let analyses: Vec<Value> = store_items(m, "analysis")
         .into_iter()
         .filter(|(k, _)| k.starts_with(&format!("{call_id}:")))
         .map(|(_, v)| v)
         .collect();
     assert!(
-        analyses.len() >= 3,
-        "segments of 5 s over ~16 s: {analyses:?}"
+        analyses.len() >= 2,
+        "segments of 5 s over the recorded part of ~16 s: {analyses:?}"
     );
     let mut segments: Vec<u64> = analyses
         .iter()
@@ -567,13 +600,59 @@ async fn tc_video_meeting_assistant_streams_records_transcribes_and_analyses_per
     for a in &analyses {
         assert_eq!(a["participantId"], p_sam["participantId"], "only Sam: {a}");
         assert_eq!(a["status"], "complete", "{a}");
+        assert_eq!(a["analysed"], true, "{a}");
         assert_eq!(a["advisory"], true);
         let frames = a["frames"].as_u64().unwrap();
         assert!(frames >= 1, "{a}");
-        assert_eq!(a["result"]["framesSeen"].as_u64(), Some(frames), "{a}");
-        assert_eq!(a["result"]["audioSeen"], true, "{a}");
+        assert_eq!(a["seen"]["frames"].as_u64(), Some(frames), "{a}");
+        assert_eq!(a["seen"]["audio"], true, "{a}");
         assert!(a["result"]["emotion"]["modalities"].is_object(), "{a}");
+        assert!(a["result"].get("framesSeen").is_none(), "{a}");
+        let removed = a["removedKeys"].as_array().unwrap();
+        assert!(removed.iter().any(|k| k == "framesSeen"), "{a}");
+        assert_eq!(a["provider"], "gemini", "{a}");
+        // The segment's media: sealed objects in the bucket, named by the row's references.
+        let audio = &a["media"]["audio"];
+        assert_eq!(audio["kind"], "media", "{a}");
+        let key = audio["uri"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("s3://meeting-recordings/")
+            .unwrap()
+            .to_string();
+        assert!(key.contains(&format!("/{call_id}/segments/p")), "{key}");
+        let stored = store
+            .get(&key)
+            .await
+            .expect("read the bucket")
+            .expect("the segment exists in the bucket");
+        assert_eq!(
+            audio["sha256"],
+            sutra_objectstore::sha256_hex(&stored).as_str()
+        );
+        let (_, wav) = sutra_objectstore::sealed::open(&kek, &key, &stored)
+            .expect("the segment opens with the KEK");
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(
+            a["media"]["frames"].as_array().map(Vec::len),
+            Some(frames as usize)
+        );
     }
+    // Alex (staff) was never cut into segments: no segment object of Alex in the bucket.
+    let alex_index = p_alex["participantIndex"].as_u64().unwrap();
+    let written = store
+        .list_objects(&format!(
+            "sessions/default/video-meeting-assistant/1.0.0/{call_id}/segments/"
+        ))
+        .await
+        .expect("list the bucket");
+    assert!(!written.is_empty());
+    assert!(
+        written
+            .iter()
+            .all(|o| !o.key.contains(&format!("/segments/p{alex_index}/"))),
+        "{written:?}"
+    );
     assert_eq!(
         record["analysis"]["results"].as_u64(),
         Some(analyses.len() as u64)
@@ -583,8 +662,6 @@ async fn tc_video_meeting_assistant_streams_records_transcribes_and_analyses_per
     // THE RECORDINGS: one per participant, sealed; the audited SHA-256 is the stored object's.
     let recordings = record["recordings"].as_array().expect("recordings");
     assert_eq!(recordings.len(), 2, "{record}");
-    let kek = sutra_crypto::Kek::from_secret(KEK.as_bytes());
-    let store = recordings_store(m);
     for reference in recordings {
         assert_eq!(reference["kind"], "media");
         assert_eq!(reference["consentAnnounced"], true);

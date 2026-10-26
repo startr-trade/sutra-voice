@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WHO IS ANALYSED. A decision table over the role a participant was admitted with (declared by
+  the meeting room, never inferred), the deployment's switch `allowStaff`, and whether the people
+  concerned opted in (`optedIn`). FIRST hit policy: the first matching rule wins.
+
+  Inferring the emotions of people AT WORK is prohibited in the EU (AI Act, Art. 5(1)(f)), so a
+  staff role is analysed only where the deployment allows it AND the participant opted in. An
+  external party (a customer, a guest) is analysed. Anyone else is not.
+
+  The outputs `analysed` and `analysisPolicy` merge into the process variables.
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20230324/MODEL/"
+             namespace="urn:sutra:module:video-meeting-assistant:analysis-policy">
+  <decision id="analysisPolicy" name="Is this participant analysed?">
+    <decisionTable hitPolicy="FIRST">
+      <input id="i_role" label="role"><inputExpression typeRef="string"><text>role</text></inputExpression></input>
+      <input id="i_allow" label="allowStaff"><inputExpression typeRef="boolean"><text>allowStaff</text></inputExpression></input>
+      <input id="i_opted" label="optedIn"><inputExpression typeRef="boolean"><text>optedIn</text></inputExpression></input>
+      <output id="o_analysed" name="analysed" typeRef="boolean"/>
+      <output id="o_policy" name="analysisPolicy" typeRef="string"/>
+      <rule id="r_staff_opted_in">
+        <inputEntry><text>"staff","internal","employee","agent","host"</text></inputEntry>
+        <inputEntry><text>true</text></inputEntry>
+        <inputEntry><text>true</text></inputEntry>
+        <outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"staff-opted-in"</text></outputEntry>
+      </rule>
+      <rule id="r_staff">
+        <inputEntry><text>"staff","internal","employee","agent","host"</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>"staff-not-opted-in"</text></outputEntry>
+      </rule>
+      <rule id="r_external">
+        <inputEntry><text>"external"</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>true</text></outputEntry>
+        <outputEntry><text>"analysed"</text></outputEntry>
+      </rule>
+      <rule id="r_other">
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <inputEntry><text>-</text></inputEntry>
+        <outputEntry><text>false</text></outputEntry>
+        <outputEntry><text>"role-not-analysed"</text></outputEntry>
+      </rule>
+    </decisionTable>
+  </decision>
+</definitions>

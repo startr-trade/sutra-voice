@@ -2171,21 +2171,22 @@ impl VoipHub {
         // `record`: `true`, `after-consent` (the recording starts once an announcement marked
         // `consent: true` has played to the end, as on a `record: after-consent` channel) or
         // `false`. A request the process marked `capture=media` is recorded either way.
-        let (asked, after_consent) =
-            match field(&["record"], "x-record")
-                .map(|v| v.trim().to_ascii_lowercase())
-                .as_deref()
-            {
-                None | Some("false") => (false, false),
-                Some("true") => (true, false),
-                Some("after-consent") => (true, true),
-                Some(other) => return Err(OpError::permanent(
+        let (asked, after_consent) = match field(&["record"], "x-record")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("false") => (false, false),
+            Some("true") => (true, false),
+            Some("after-consent") => (true, true),
+            Some(other) => {
+                return Err(OpError::permanent(
                     codes::OUTBOUND_INVALID,
                     format!(
                         "originate 'record' must be true, false or after-consent, got '{other}'"
                     ),
-                )),
-            };
+                ))
+            }
+        };
         let record = captured || asked;
         if record && self.recorder.is_none() {
             return Err(OpError::permanent(

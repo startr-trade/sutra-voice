@@ -539,6 +539,15 @@ async fn tc_meeting_assistant_joins_records_transcribes_and_reports() {
     let recording = &report["recording"];
     assert_eq!(recording["kind"], "media", "{report}");
     assert_eq!(recording["consentAnnounced"], true, "{recording}");
+    // `record: after-consent`: the recording began once the announcement had played to the end.
+    assert!(
+        recording["consentAnnouncedAtMs"].as_i64().unwrap() <= 0,
+        "the announcement precedes the recording: {recording}"
+    );
+    assert!(
+        recording["startMs"].as_u64().unwrap() >= 1_500,
+        "the recording starts after the PIN and the 1.6 s announcement: {recording}"
+    );
     assert_eq!(recording["format"], "audio/wav");
     assert_eq!(recording["encryption"]["keyId"], "recordings");
 
@@ -583,8 +592,8 @@ async fn tc_meeting_assistant_joins_records_transcribes_and_reports() {
     assert_eq!(&opened.plaintext[..4], b"RIFF");
     let duration = recording["durationMs"].as_u64().unwrap();
     assert!(
-        (18_000..=40_000).contains(&duration),
-        "the recording spans the call ({duration} ms)"
+        (10_000..=40_000).contains(&duration),
+        "the recording spans the conversation ({duration} ms)"
     );
 
     // THE TRANSCRIPT: one row per segment, in order, no speaker labels.
@@ -645,6 +654,57 @@ async fn tc_meeting_assistant_joins_records_transcribes_and_reports() {
 
     let sent = sent_report(meeting).await;
     assert_eq!(sent["recording"]["sha256"], sha256.as_str());
+
+    // THE TRANSPORT'S AUDIT EVENTS land in the instance journal: a meeting whose dial-in is off the
+    // allow-list (SUTRA_VOIP_ORIGINATE_ALLOW=+1555*) is refused by the toll-fraud controls, and
+    // the refusal is a `voip.ORIGINATE_REFUSED` row of that instance's own audit trail.
+    post_join(
+        meeting,
+        json!({"meetingId": "M-2", "title": "Off the list", "dialIn": "+447700900123",
+               "pin": PIN, "participants": [{"name": "Kim", "role": "external"}]}),
+    )
+    .await;
+    let instance = wait_for(
+        "the refused originate in the audit journal",
+        Duration::from_secs(30),
+        || {
+            let id = sql(
+                meeting,
+                "SELECT instance_id::text FROM audit_event \
+                 WHERE event_type = 'voip.ORIGINATE_REFUSED' LIMIT 1",
+            );
+            (!id.is_empty()).then_some(id)
+        },
+    )
+    .await;
+    assert_eq!(
+        sql(
+            meeting,
+            &format!(
+                "SELECT count(*) FROM audit_event WHERE instance_id::text = '{instance}' \
+                 AND event_type = 'INSTANCE_STARTED'"
+            )
+        ),
+        "1",
+        "the row is in the journal of the instance that asked to dial"
+    );
+    assert_eq!(
+        sql(
+            meeting,
+            "SELECT diagnostic_code FROM audit_event WHERE event_type = 'voip.ORIGINATE_REFUSED' LIMIT 1"
+        ),
+        "SUTRA.VOIP.ORIGINATE_REFUSED"
+    );
+    // The process audits at `media` level: the event is written without its fields, so the
+    // destination never reaches the audit trail.
+    assert!(
+        !sql(
+            meeting,
+            "SELECT count(*) FROM audit_event WHERE payload_json LIKE '%7700900123%'"
+        )
+        .starts_with('1'),
+        "the refused destination is not in the audit trail"
+    );
 }
 
 // ---- tier 1 -----------------------------------------------------------------------------------

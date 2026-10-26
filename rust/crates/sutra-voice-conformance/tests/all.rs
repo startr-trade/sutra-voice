@@ -13,6 +13,8 @@ use sutra_formats as _;
 #[path = "all/support.rs"]
 mod support;
 
+#[path = "all/analysis_flows.rs"]
+mod analysis_flows;
 #[path = "all/tc_ivr_dtmf.rs"]
 mod tc_ivr_dtmf;
 #[path = "all/tc_meeting_assistant.rs"]

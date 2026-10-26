@@ -26,6 +26,11 @@ sutra-objectstore = { workspace = true }
 sutra-crypto = { workspace = true }
 # ... with the streamed-recording reader (the sealed-stream format).
 sutra-transport-voip = { path = "../sutra-transport-voip" }
+# The example flows' decision tables and FEEL, evaluated on the host (tier 1) with the engine's
+# own evaluators: the analysis policy and fusion are checked without a container.
+sutra-dmn = { workspace = true }
+sutra-feel = { workspace = true }
+sutra-executor = { workspace = true }
 # Per-suite ad-hoc containers (rustpbx, SIPp, LiveKit, MinIO, the stub model).
 testcontainers = { workspace = true }
 serde_json = { workspace = true }

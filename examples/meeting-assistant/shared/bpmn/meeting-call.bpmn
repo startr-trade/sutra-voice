@@ -14,13 +14,14 @@
            4 hours       the bot leaves (voip://hangup), then waits for the hang-up
       -> read the transcript back (one store read per segment, a loop)
       -> the report: a model job (JSON: summary, decisions, action items, speakers) over the
-         transcript and the call's acoustic metrics
+         transcript and the call's acoustic metrics (the prompt is built here, in FEEL)
       -> the analysis policy applied (below) -> rendered (meeting-report.hbs)
       -> stored (meetings, "report:<meetingId>") and handed to `report-out`, with the recording's
          reference.
 
   THE MEDIA PLANE never passes through this flow. `<q:audit capture="media">` marks every request
-  this process sends, and the `voip` transport records a marked call: the audio goes to the
+  this process sends, and the `voip` transport records a marked call (`record: after-consent` on
+  the originate: from the end of the consent announcement on): the audio streams to the
   deployment's object store, sealed (envelope encryption), and the hang-up carries only its
   REFERENCE (uri, SHA-256 of the stored object, duration, format, consentAnnounced). The audit
   events of this process carry that reference too — never the audio. The live transcription runs
@@ -31,15 +32,17 @@
   speakers, so every segment says speaker "unknown". The report model attributes the transcript to
   the participants from what was said, and the report marks that attribution as inferred.
 
-  ANALYSIS POLICY (emotion, sentiment). External participants are analysed. Internal participants
-  (staff) are analysed ONLY when this deployment allows it (`internalAnalysisAllowed`, false as
-  shipped) AND the request opts them in (`analysis.internalOptIn`) — in the EU, inferring the
-  emotions of people at work is prohibited (AI Act). The policy is applied twice: the prompt asks
-  for no emotion of a party that is not analysed, and whatever the model returns for one anyway is
-  dropped here. The analysis is advisory, for people to read, never an automated decision.
+  ANALYSIS POLICY (emotion, sentiment): the decision table rules/analysis-policy.dmn. External
+  participants are analysed. Internal participants (staff) are analysed ONLY when this deployment
+  allows it (`internalAnalysisAllowed`, false as shipped) AND the request opts them in
+  (`analysis.internalOptIn`) — in the EU, inferring the emotions of people at work is prohibited
+  (AI Act). The policy is applied twice: the prompt asks for no emotion of a party that is not
+  analysed, and whatever the model returns for one anyway is dropped here. The analysis is
+  advisory, for people to read, never an automated decision.
 
-  CONSENT. The announcement is played before the bot listens; the recording reports whether it was
-  played to the end, and where in the recording.
+  CONSENT. The announcement is played before the bot listens, and the recording starts only once
+  it has played to the end (`record: after-consent`); the recording reports that it was announced,
+  and where (`consentAnnouncedAtMs`, at or before the recording's own start).
 
   CORRELATION. The flow names the call itself (`meeting-<meetingId>`) before dialling, so every
   event of the call finds this instance through the start event's alias.
@@ -112,24 +115,40 @@
         <bpmn:assignment><bpmn:from>null</bpmn:from><bpmn:to>progress</bpmn:to></bpmn:assignment>
       </bpmn:dataInputAssociation>
     </bpmn:serviceTask>
-    <bpmn:sequenceFlow id="F_init" sourceRef="Init" targetRef="Policy"/>
+    <bpmn:sequenceFlow id="F_init" sourceRef="Init" targetRef="PolicyInputs"/>
 
-    <bpmn:serviceTask id="Policy" name="Who is analysed (FEEL)">
-      <bpmn:incoming>F_init</bpmn:incoming><bpmn:outgoing>F_policy</bpmn:outgoing>
+    <!-- The decision table decides for the internal role: external parties are always analysed. -->
+    <bpmn:serviceTask id="PolicyInputs" name="The policy's inputs (FEEL)">
+      <bpmn:incoming>F_init</bpmn:incoming><bpmn:outgoing>F_policy_inputs</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>"internal"</bpmn:from><bpmn:to>role</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>internalAnalysisAllowed</bpmn:from><bpmn:to>allowStaff</bpmn:to></bpmn:assignment>
+        <bpmn:assignment><bpmn:from>meeting.analysis != null and meeting.analysis.internalOptIn = true</bpmn:from><bpmn:to>optedIn</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_policy_inputs" sourceRef="PolicyInputs" targetRef="Policy"/>
+    <bpmn:businessRuleTask id="Policy" name="Who is analysed (DMN)" implementation="analysis-policy.dmn">
+      <bpmn:incoming>F_policy_inputs</bpmn:incoming><bpmn:outgoing>F_decided</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:sequenceFlow id="F_decided" sourceRef="Policy" targetRef="AnalysedRoles"/>
+    <bpmn:serviceTask id="AnalysedRoles" name="The analysed roles (FEEL)">
+      <bpmn:incoming>F_decided</bpmn:incoming><bpmn:outgoing>F_policy</bpmn:outgoing>
       <bpmn:dataInputAssociation>
         <bpmn:assignment>
-          <bpmn:from>if internalAnalysisAllowed and meeting.analysis != null and meeting.analysis.internalOptIn = true then ["external", "internal"] else ["external"]</bpmn:from>
+          <bpmn:from>if analysed = true then ["external", "internal"] else ["external"]</bpmn:from>
           <bpmn:to>analyzedRoles</bpmn:to>
         </bpmn:assignment>
       </bpmn:dataInputAssociation>
     </bpmn:serviceTask>
-    <bpmn:sequenceFlow id="F_policy" sourceRef="Policy" targetRef="PrepDial"/>
+    <bpmn:sequenceFlow id="F_policy" sourceRef="AnalysedRoles" targetRef="PrepDial"/>
 
     <bpmn:serviceTask id="PrepDial" name="Dial request (FEEL)">
       <bpmn:incoming>F_policy</bpmn:incoming><bpmn:outgoing>F_prep_dial</bpmn:outgoing>
       <bpmn:dataInputAssociation>
-        <!-- A bare number is dialled through the gateway's trunk (SUTRA_VOIP_TRUNK). -->
-        <bpmn:assignment><bpmn:from>{callId: callId, destination: meeting.dialIn, callerId: "+15551230000", timeoutSecs: 45, mode: "listen"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
+        <!-- A bare number is dialled through the gateway's trunk (SUTRA_VOIP_TRUNK). `record:
+             after-consent`: the call is recorded (this process audits `capture="media"`), from the
+             end of the consent announcement on. -->
+        <bpmn:assignment><bpmn:from>{callId: callId, destination: meeting.dialIn, callerId: "+15551230000", timeoutSecs: 45, mode: "listen", record: "after-consent"}</bpmn:from><bpmn:to>responseObject</bpmn:to></bpmn:assignment>
       </bpmn:dataInputAssociation>
     </bpmn:serviceTask>
     <bpmn:sequenceFlow id="F_prep_dial" sourceRef="PrepDial" targetRef="Dial"/>

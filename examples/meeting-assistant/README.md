@@ -15,16 +15,18 @@ join ─► dial (voip://originate, mode: listen) ─► connected? ─► PIN (
 ```
 
 Audio never passes through the flow. The process audits at `<q:audit capture="media">`, which
-marks every request it sends; the transport records a marked call to the object store, sealed
-(envelope encryption), and the flow — and the audit trail — get only the recording's
-**reference**: its URI, the SHA-256 of the stored object, its duration and format, and whether the
-consent announcement was played.
+marks every request it sends, and its originate asks `record: after-consent`: the transport
+records the call from the end of the consent announcement on, streaming it to the object store as
+it runs, sealed (envelope encryption). The flow, and the audit trail, get only the recording's
+**reference**: its URI, the SHA-256 of the stored object, its duration and format, and whether and
+where the consent announcement was played.
 
 | Path | What |
 |---|---|
 | `shared/bpmn/meeting-call.bpmn` | the meeting: join, listen, report |
 | `shared/bpmn/transcript-segment.bpmn` | stores each transcript segment as it completes |
 | `shared/bpmn/scheduled-join.bpmn` | a standing meeting joined on schedule (a weekly timer start) |
+| `shared/rules/analysis-policy.dmn` | who is analysed: external parties; internal staff only with the deployment's switch and an opt-in |
 | `shared/datastores.yaml`, `shared/schemas/meeting/`, `shared/migrations/` | `transcripts` (a projected store: one typed row per segment) and `meetings` (reports, standing meetings) |
 | `shared/templates/meeting-report.hbs` | the report |
 | `variants/meeting-stub/`, `variants/meeting-live/` | the channels: the stub model, or real providers |
@@ -91,8 +93,9 @@ and the trunk line released at the hang-up.
 - **Recordings.** Any S3-compatible store: set `SUTRA_VOIP_RECORDING_STORE` to
   `s3://<bucket>/<prefix>`, drop `SUTRA_VOIP_RECORDING_ENDPOINT` for AWS itself, and give the
   credentials and the KEK as `secret:` / `vault:` references. `SUTRA_VOIP_RECORDING_ENCRYPTION=none`
-  leaves sealing to a store that encrypts at rest itself. The whole call is held in memory until
-  the hang-up (8 kHz mono, about 58 MB an hour; `SUTRA_VOIP_RECORDING_MAX_SECONDS` bounds it).
+  leaves sealing to a store that encrypts at rest itself. The recording streams to the store
+  while the call is up (5 MiB parts of one-second sealed chunks, spooled on disk in between), so
+  memory does not grow with the call; `SUTRA_VOIP_RECORDING_MAX_SECONDS` caps its length.
 
 ## Live transcription: which providers
 
@@ -122,15 +125,18 @@ OpenAI's background responses.
 - **Consent.** Recording and transcription consent rules differ by jurisdiction (one-party,
   all-party, or notice-based). The bot announces itself before it listens, and the recording
   states whether the announcement was played to the end and where (`consentAnnounced`,
-  `consentAnnouncedAtMs`). The recording starts when the media connects, so the announcement is
-  in it; if your jurisdiction requires consent before any recording, get it out of band (the
-  meeting invitation) or do not record (`<q:audit capture="metadata">`: no recording, transcript
-  still produced). This example is not legal advice.
+  `consentAnnouncedAtMs`). The originate asks `record: after-consent`, so the recording starts
+  only once the announcement has played to the end: nothing before it is recorded, and
+  `consentAnnouncedAtMs` is at or before the recording's start. Where the announcement in the call
+  is not enough, get consent out of band (the meeting invitation), or do not record
+  (`<q:audit capture="metadata">`: no recording, the transcript is still produced). This example is
+  not legal advice.
 - **Emotion analysis is regulated.** In the EU (AI Act) inferring the emotions of people **at
   work** is prohibited — that includes your own staff in an internal meeting. So the policy is
   per party: **external** participants are analysed; **internal** participants only when the
   deployment allows it (`internalAnalysisAllowed` in `meeting-call.bpmn`, `false` as shipped)
-  AND the request opts them in (`analysis.internalOptIn`). Do not turn the switch on for an EU
+  AND the request opts them in (`analysis.internalOptIn`): the decision table
+  `shared/rules/analysis-policy.dmn` decides. Do not turn the switch on for an EU
   workplace. The policy is applied twice: the prompt asks for no emotion of a non-analysed party,
   and whatever the model returns for one anyway is dropped before the report is written.
 - **Advisory only.** Sentiment and emotion in the report are a model's inference for the people

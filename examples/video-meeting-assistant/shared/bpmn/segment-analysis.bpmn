@@ -1,60 +1,164 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  ONE SEGMENT ANALYSIS, STORED. For every time segment of the session and every participant whose
-  role is analysed, the `voip` transport sends that participant's audio of the segment, its
-  sampled camera frames and the words spoken to a video-understanding model, and delivers the
-  answer on `call-analysis`; each one starts this short process, which writes it to the
-  `analysis` store under "<callId>:<participantIndex>:<segment>" and ends.
+  ONE SEGMENT OF ONE PARTICIPANT: DECIDED, ANALYSED, FUSED, STORED. The `voip` transport cuts the
+  session into fixed segments; as each one closes it writes the participant's audio of the segment
+  and the frames sampled in it to the object store (sealed) and delivers their REFERENCES on
+  `call-segment`. Each message starts this short process:
 
-  The answer is per participant and per segment: expression, engagement / attention, body-language
-  cues, a fused emotion estimate stating which modalities (voice, face, body, words) support it
-  and with what confidence, and whether the modalities DISAGREE (reported, never averaged away).
-  A listener is analysed as well as the speaker: a reaction is often the most telling cue.
+    WHO IS ANALYSED   the decision table rules/analysis-policy.dmn, over the role the room
+                      declared and this deployment's switch (`allowStaff`, false as shipped):
+                      external parties yes, staff only with the switch AND an opt-in, anyone
+                      else no. A participant who is not analysed never has its media sent to a
+                      model: the row says so and why.
+    THE MODEL CALL    the prompt is built here (FEEL) and sent through the `video-analysis` llm
+                      channel with the media as {ref, sha256} parts. The channel's `media-store`
+                      reads each object, checks its digest and opens it; the media never passes
+                      through this process, its variables or its audit events (they carry the
+                      references).
+    THE FUSION        the answer is cut down to the fields asked for (anything else, such as an
+                      inferred age or identity, is dropped and listed in `removedKeys`); a
+                      modality the model claims but was not sent is false, not guessed
+                      (`unsupportedClaims`); an emotion supported by no modality is withheld; a
+                      disagreement between the signals is kept as the model reported it, never
+                      averaged away.
+    THE ROW           stored in `analysis` under "<callId>:<participantIndex>:<segment>".
 
-  It is ADVISORY data for people to review, never an automated decision about anyone. No frame is
-  stored here or anywhere: the transport keeps frames in memory until their segment is analysed.
+  The analysis is ADVISORY, for people to review, never an automated decision about anyone.
+  `<q:audit capture="media">`: the audit events carry the segment's references, so subject erasure
+  and retention reach the stored segments.
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                   xmlns:q="urn:sutra:q:1.0"
                   id="Definitions_segment_analysis"
                   targetNamespace="urn:sutra:module:video-meeting-assistant:1.0.0">
 
   <bpmn:dataStore id="analysisStore" name="analysis"/>
 
-  <bpmn:process id="segment-analysis" name="Store one segment analysis" isExecutable="true">
+  <bpmn:process id="segment-analysis" name="Analyse one participant over one segment" isExecutable="true">
     <bpmn:extensionElements>
-      <q:audit capture="metadata"/>
+      <q:audit capture="media"/>
     </bpmn:extensionElements>
 
     <bpmn:dataObject id="doRow" name="row"/>
     <bpmn:dataStoreReference id="dsrRow" name="analysis" dataStoreRef="analysisStore">
-      <bpmn:extensionElements><q:store key="analysis.key"/></bpmn:extensionElements>
+      <bpmn:extensionElements><q:store key="segment.key"/></bpmn:extensionElements>
     </bpmn:dataStoreReference>
 
-    <!-- { callId, key, participantId, participantIndex, label, role, segment, startMs, endMs,
-         speaking, talkMs, frames, framesRequested, audioMs, audioSent, features, flaggedMoments,
-         provider, model, status, result, removedKeys, missingFields | detail } -->
-    <bpmn:startEvent id="Start" name="Segment analysed">
+    <!-- { callId, key, participantId, participantIndex, participant ("P<n>"), label, role,
+         segment, startMs, endMs, speaking, talkMs, audioMs, features, flaggedMoments, words,
+         present, audio: <media reference> | null, frames: [<media reference>, atMs, requested],
+         status } -->
+    <bpmn:startEvent id="Start" name="A segment closed">
       <bpmn:extensionElements>
-        <q:source channel="call-analysis" name="analysis" dataClass="pii"/>
+        <q:source channel="call-segment" name="segment" dataClass="pii"/>
       </bpmn:extensionElements>
       <bpmn:outgoing>F_start</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="BuildRow"/>
+    <bpmn:sequenceFlow id="F_start" sourceRef="Start" targetRef="Prepare"/>
 
-    <bpmn:serviceTask id="BuildRow" name="The row (FEEL)">
-      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
+    <bpmn:serviceTask id="Prepare" name="The policy's inputs (FEEL)">
+      <bpmn:incoming>F_start</bpmn:incoming><bpmn:outgoing>F_prepared</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment><bpmn:from>segment.role</bpmn:from><bpmn:to>role</bpmn:to></bpmn:assignment>
+        <!-- THE DEPLOYMENT SWITCH: may staff be analysed at all? Off as shipped. Turning it on is
+             a decision for your counsel (EU: prohibited at work). Keep it equal to the one in
+             video-meeting.bpmn. -->
+        <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>allowStaff</bpmn:to></bpmn:assignment>
+        <!-- No per-participant opt-in is collected in this example. -->
+        <bpmn:assignment><bpmn:from>false</bpmn:from><bpmn:to>optedIn</bpmn:to></bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_prepared" sourceRef="Prepare" targetRef="Policy"/>
+
+    <bpmn:businessRuleTask id="Policy" name="Who is analysed (DMN)" implementation="analysis-policy.dmn">
+      <bpmn:incoming>F_prepared</bpmn:incoming><bpmn:outgoing>F_decided</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:sequenceFlow id="F_decided" sourceRef="Policy" targetRef="Analysed"/>
+
+    <bpmn:exclusiveGateway id="Analysed" name="Analysed, with media?" default="F_not_analysed">
+      <bpmn:incoming>F_decided</bpmn:incoming>
+      <bpmn:outgoing>F_analyse</bpmn:outgoing>
+      <bpmn:outgoing>F_not_analysed</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:sequenceFlow id="F_analyse" name="yes" sourceRef="Analysed" targetRef="BuildRequest">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">analysed = true and segment.status = "complete" and (segment.audio != null or count(segment.frames) &gt; 0)</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="F_not_analysed" sourceRef="Analysed" targetRef="NotAnalysed"/>
+
+    <!-- ---- the model call: the prompt, and the media as references ---- -->
+    <bpmn:serviceTask id="BuildRequest" name="The prompt (FEEL)">
+      <bpmn:incoming>F_analyse</bpmn:incoming><bpmn:outgoing>F_built_request</bpmn:outgoing>
       <bpmn:dataInputAssociation>
         <bpmn:assignment>
-          <bpmn:from>{callId: analysis.callId, participantId: analysis.participantId, participantIndex: analysis.participantIndex, label: analysis.label, role: analysis.role, segment: analysis.segment, startMs: analysis.startMs, endMs: analysis.endMs, speaking: analysis.speaking, talkMs: analysis.talkMs, frames: analysis.frames, framesRequested: analysis.framesRequested, audioMs: analysis.audioMs, audioSent: analysis.audioSent, acoustic: analysis.features, flaggedMoments: analysis.flaggedMoments, status: analysis.status, result: analysis.result, removedKeys: analysis.removedKeys, detail: analysis.detail, provider: analysis.provider, model: analysis.model, advisory: true, recordedAt: string(now())}</bpmn:from>
+          <bpmn:from>{participant: segment.participant, role: segment.role, speaking: segment.speaking, talkMs: segment.talkMs, present: segment.present, words: segment.words, acoustic: segment.features, flaggedMoments: segment.flaggedMoments, frames: count(segment.frames), audio: segment.audio != null, segment: {index: segment.segment, startMs: segment.startMs, endMs: segment.endMs}}</bpmn:from>
+          <bpmn:to>promptContext</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{json: true, maxOutputTokens: 1024, temperature: 0, system: "You analyse ONE participant of a recorded meeting over ONE time segment, from that participant's own audio and sampled camera frames, and the words spoken in the segment by everyone present. Participants are named only by pseudonyms (P1, P2, ...). Report observable cues only: facial expression, gaze and attention, nods and head shakes, posture and posture shifts, gestures, fidgeting, turning away; the voice's tone and energy; and the participant's reaction to what others said, even while listening. Never identify the person and never estimate age, gender, ethnicity, health, religion, political or sexual orientation or any other sensitive attribute; do not describe appearance beyond those cues. Answer with ONE JSON object with the keys expression (string), engagement (high, medium or low), attention (string), bodyLanguage (list of strings), emotion (an object: label, confidence from 0 to 1, and modalities: an object of booleans voice, face, body, words saying which signals support the label), disagreement (an object: flagged, a boolean, and detail, a string or null) and reactions (a list of objects: atMs, to, cue). When the signals disagree (a calm voice with tense posture and averted gaze, say) set disagreement.flagged and describe it; never average it away. A missing signal (no frames, no speech) is false, not guessed. The estimate is advisory, for people to review.", messages: [{role: "user", content: "Analyse participant " + segment.participant + " over this segment. Context: " + string(promptContext), audio: if segment.audio = null then null else {ref: segment.audio.uri, sha256: segment.audio.sha256, format: segment.audio.format}, video: if count(segment.frames) = 0 then null else {frames: for f in segment.frames return {ref: f.uri, sha256: f.sha256, format: f.format, atMs: f.atMs}}}]}</bpmn:from>
+          <bpmn:to>requestBody</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_built_request" sourceRef="BuildRequest" targetRef="AskModel"/>
+
+    <!-- Synchronous: the channel reads each referenced object from its media-store, checks the
+         digest and size, opens the sealed object and sends it; the answer comes back parsed
+         under `json`. -->
+    <bpmn:serviceTask id="AskModel" name="Ask the video-understanding model" implementation="channel:video-analysis">
+      <bpmn:extensionElements><q:timeout duration="PT90S"/></bpmn:extensionElements>
+      <bpmn:incoming>F_built_request</bpmn:incoming><bpmn:outgoing>F_answered</bpmn:outgoing>
+      <bpmn:dataOutputAssociation>
+        <bpmn:assignment><bpmn:from>payload</bpmn:from><bpmn:to>answer</bpmn:to></bpmn:assignment>
+      </bpmn:dataOutputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_answered" sourceRef="AskModel" targetRef="Fuse"/>
+
+    <!-- ---- the fusion: only what was asked, only what was sent, disagreement kept ---- -->
+    <bpmn:serviceTask id="Fuse" name="Fuse the signals (FEEL)">
+      <bpmn:incoming>F_answered</bpmn:incoming><bpmn:outgoing>F_fused</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{voice: segment.audio != null, face: count(segment.frames) &gt; 0, body: count(segment.frames) &gt; 0, words: count(segment.words) &gt; 0}</bpmn:from>
+          <bpmn:to>sent</bpmn:to>
+        </bpmn:assignment>
+        <bpmn:assignment>
+          <bpmn:from>{reply: if answer = null then null else answer.json, claimed: if reply = null or reply.emotion = null or reply.emotion.modalities = null then {} else reply.emotion.modalities, modalities: {voice: sent.voice and claimed.voice = true, face: sent.face and claimed.face = true, body: sent.body and claimed.body = true, words: sent.words and claimed.words = true}, supported: count([modalities.voice, modalities.face, modalities.body, modalities.words][item = true]), unsupportedClaims: (for name in ["voice", "face", "body", "words"] return if getValue(claimed, name) = true and getValue(sent, name) = false then name else null)[item != null], removedKeys: if reply = null then [] else (for e in get entries(reply) return if list contains(["expression", "engagement", "attention", "bodyLanguage", "emotion", "disagreement", "reactions"], e.key) then null else e.key)[item != null], result: if reply = null then null else {expression: reply.expression, engagement: reply.engagement, attention: reply.attention, bodyLanguage: if reply.bodyLanguage = null then [] else reply.bodyLanguage, emotion: if supported = 0 or reply.emotion = null then null else {label: reply.emotion.label, confidence: reply.emotion.confidence, modalities: modalities}, disagreement: {flagged: reply.disagreement != null and reply.disagreement.flagged = true, detail: if reply.disagreement = null then null else reply.disagreement.detail}, reactions: for r in (if reply.reactions = null then [] else reply.reactions) return {atMs: r.atMs, to: r.to, cue: r.cue}}}</bpmn:from>
+          <bpmn:to>fused</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_fused" sourceRef="Fuse" targetRef="BuildRow"/>
+
+    <!-- In a FEEL context an entry can read the entries before it, so a key named like a variable
+         (`segment`) comes last: entries after it would read the key, not the variable. -->
+    <bpmn:serviceTask id="BuildRow" name="The row (FEEL)">
+      <bpmn:incoming>F_fused</bpmn:incoming><bpmn:outgoing>F_built</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{callId: segment.callId, participantId: segment.participantId, participantIndex: segment.participantIndex, label: segment.label, role: segment.role, startMs: segment.startMs, endMs: segment.endMs, speaking: segment.speaking, talkMs: segment.talkMs, analysed: true, analysisPolicy: analysisPolicy, frames: count(segment.frames), framesRequested: count(segment.frames[item.requested = true]), audioMs: segment.audioMs, audioSent: segment.audio != null, acoustic: segment.features, flaggedMoments: segment.flaggedMoments, status: if fused.result = null then "failed" else "complete", result: fused.result, removedKeys: fused.removedKeys, unsupportedClaims: fused.unsupportedClaims, seen: if fused.reply = null then null else {frames: fused.reply.framesSeen, audio: fused.reply.audioSeen}, provider: answer.provider, model: answer.model, media: {audio: segment.audio, frames: segment.frames}, advisory: true, recordedAt: string(now()), segment: segment.segment}</bpmn:from>
           <bpmn:to>row</bpmn:to>
         </bpmn:assignment>
       </bpmn:dataInputAssociation>
     </bpmn:serviceTask>
     <bpmn:sequenceFlow id="F_built" sourceRef="BuildRow" targetRef="Save"/>
 
-    <bpmn:serviceTask id="Save" name="Store the analysis">
-      <bpmn:incoming>F_built</bpmn:incoming><bpmn:outgoing>F_saved</bpmn:outgoing>
+    <!-- Not analysed: the row records that, and why. No media was sent anywhere. -->
+    <bpmn:serviceTask id="NotAnalysed" name="Not analysed (FEEL)">
+      <bpmn:incoming>F_not_analysed</bpmn:incoming><bpmn:outgoing>F_not_analysed_row</bpmn:outgoing>
+      <bpmn:dataInputAssociation>
+        <bpmn:assignment>
+          <bpmn:from>{callId: segment.callId, participantId: segment.participantId, participantIndex: segment.participantIndex, label: segment.label, role: segment.role, startMs: segment.startMs, endMs: segment.endMs, talkMs: segment.talkMs, analysed: false, analysisPolicy: if analysed = true then "no-media" else analysisPolicy, status: "not-analysed", detail: segment.detail, advisory: true, recordedAt: string(now()), segment: segment.segment}</bpmn:from>
+          <bpmn:to>row</bpmn:to>
+        </bpmn:assignment>
+      </bpmn:dataInputAssociation>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="F_not_analysed_row" sourceRef="NotAnalysed" targetRef="Save"/>
+
+    <bpmn:serviceTask id="Save" name="Store the row">
+      <bpmn:incoming>F_built</bpmn:incoming>
+      <bpmn:incoming>F_not_analysed_row</bpmn:incoming>
+      <bpmn:outgoing>F_saved</bpmn:outgoing>
       <bpmn:dataOutputAssociation>
         <bpmn:sourceRef>doRow</bpmn:sourceRef>
         <bpmn:targetRef>dsrRow</bpmn:targetRef>

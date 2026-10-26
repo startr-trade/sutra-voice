@@ -61,6 +61,16 @@ services:
       RECORDINGS_SECRET_KEY: ${RECORDINGS_SECRET_KEY:-dev-only-secret-key}
       RECORDINGS_KEK: ${RECORDINGS_KEK:-dev-only-recordings-kek-change-me}
 
+      # THE SAME BUCKET, AS THE ENGINE'S OBJECT STORE `recordings`: the `video-analysis` llm channel
+      # (`media-store: recordings`) reads each segment the transport wrote from it, checks its
+      # SHA-256 and opens it with the same key-encryption key; erasure and retention delete there.
+      SUTRA_OBJECT_STORES: recordings
+      SUTRA_OBJECT_STORES_RECORDINGS_URI: s3://meeting-recordings/sessions
+      SUTRA_OBJECT_STORES_RECORDINGS_ENDPOINT: http://recordings:9000
+      SUTRA_OBJECT_STORES_RECORDINGS_ACCESS_KEY: env:RECORDINGS_ACCESS_KEY
+      SUTRA_OBJECT_STORES_RECORDINGS_SECRET_KEY: env:RECORDINGS_SECRET_KEY
+      SUTRA_OBJECT_STORES_RECORDINGS_KEK: env:RECORDINGS_KEK
+
       # What channels.yaml and datastores.yaml name by reference.
       MEETING_DB_URL: postgres://engine-db:5432/sutra
       MEETING_DB_USER: ${ENGINE_DB_USER:-sutra_engine}
