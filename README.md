@@ -64,7 +64,8 @@ README has the exact commands and a local compose stack.
 
 `make lint` (clippy `-D warnings`), `make fmt-check`, `make audit` (cargo-audit + cargo-deny) and
 `make scan-deps` / `make scan-image` / `make worker-scan` (Trivy) are the other gates; CI runs
-fmt, lint, tier 1 and audit.
+fmt, lint, tier 1, audit (of both workspaces) and the book. Tier 2 and the worker's lint and tests
+run nightly; Trivy and CodeQL run on every push.
 
 ## The engine pin
 
@@ -76,6 +77,34 @@ files under `engine/` from this repository; make the change in the engine and mo
 > `github.com/startr-trade/sutra`, a fresh `git submodule update` cannot fetch it; a clone made
 > next to a local engine checkout can fetch it from there
 > (`git -C engine fetch <path-to-engine-checkout>`).
+
+## Releases
+
+A release is a `v*` tag; `.github/workflows/release.yml` does the rest and nothing else publishes.
+It ships two images, each multi-arch (linux/amd64 + linux/arm64, built natively), cosign-signed
+(keyless), with SLSA provenance and an SPDX SBOM attested to the digest and attached to the GitHub
+Release:
+
+| Image | What it is |
+|---|---|
+| `ghcr.io/startr-trade/sutra-voice` | the voice engine (`sutra-voice-engine`) |
+| `ghcr.io/startr-trade/sutra-webrtc-worker` | the WebRTC media worker and `sutra-webrtc-participant` |
+
+No CLI and no crates are published. The release body is `.github/releases/v<version>.md`.
+Before anything is built, the tag must pass four gates; each is a script you can run locally:
+
+1. **CI passed on the tagged commit** — `scripts/release-ci-gate.sh` asks GitHub for `ci.yml`'s
+   run on that commit (waiting while it runs).
+2. **The tag names the version** of both workspaces — `scripts/release-version-gate.sh v0.6.0`
+   (`rust/Cargo.toml` and `tools/sutra-webrtc-worker/Cargo.toml`).
+3. **`engine/` pins a released engine** — `scripts/release-engine-pin-gate.sh v0.6.0`: the pinned
+   commit must be exactly a `v*` tag of `github.com/startr-trade/sutra`, a final one for a final
+   release, with the same `MAJOR.MINOR`. Versions are aligned by minor with their own patch:
+   sutra-voice 0.6.x runs on engine 0.6.x.
+4. **Each image is clean under Trivy** before it is tagged — every severity, suppressions only
+   through `.trivyignore.yaml` (`make scan-image`, `make worker-scan` locally).
+
+So the order is: the engine tag exists → the pin names it → CI is green on the commit → tag it.
 
 ## License
 

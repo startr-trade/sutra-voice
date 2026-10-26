@@ -1,0 +1,531 @@
+name: Release
+
+# Fires on a semver tag (`v*`). `main` never publishes anything.
+#
+# Ships EXACTLY two container images — nothing else in this repository is a published deliverable
+# (no CLI, no crates):
+#
+#   1. ghcr.io/startr-trade/sutra-voice          — the voice engine (`sutra-voice-dist` →
+#      `sutra-voice-engine`, built by ./Dockerfile with the `engine/` submodule)
+#   2. ghcr.io/startr-trade/sutra-webrtc-worker  — the WebRTC media worker and
+#      `sutra-webrtc-participant` (tools/sutra-webrtc-worker/Dockerfile)
+#
+# Each the way the engine repository ships its own image: linux/amd64 + linux/arm64, each built
+# NATIVELY on a runner of that architecture, pushed by digest, scanned before it is tagged, fused
+# into one manifest list, cosign-signed (keyless), with SLSA provenance from buildkit and an SPDX
+# SBOM cosign-attested to the digest and attached to the GitHub Release. The release body is
+# .github/releases/<tag>.md.
+#
+# THE GATES. Nothing is published unless every one passes, and they are checked in this order:
+#
+#   1. CI passed on the tagged commit                    (`tag` job, scripts/release-ci-gate.sh)
+#   2. the tag names the version of BOTH workspaces      (`tag` job, scripts/release-version-gate.sh)
+#   3. `engine/` pins exactly a released engine `v*` tag
+#      of github.com/startr-trade/sutra, of the same
+#      MAJOR.MINOR                                        (`tag` job, scripts/release-engine-pin-gate.sh)
+#   4. each image, per architecture, has no Trivy finding
+#      the triage record does not account for            (`image-build` job, before any tag exists)
+#
+# Third-party actions are pinned by commit SHA, with the version they resolved to in a comment.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re-)release, e.g. v0.6.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io/startr-trade
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. THE GATES (1–3). Nothing is built from a commit that fails one.
+  # ---------------------------------------------------------------------------
+  tag:
+    name: check the tag (CI, versions, engine pin)
+    runs-on: ubuntu-latest
+    # Longer than the CI gate's own 45-minute wait, so a release tagged while CI is still running
+    # waits for CI rather than being killed by the job timeout.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read # reading another workflow's runs
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      # No submodule: gate 3 reads the pin from this commit's tree (the gitlink), and asks GitHub
+      # for the engine's tags — it needs nothing checked out under engine/.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # On a workflow_dispatch re-release the ambient GITHUB_SHA is the dispatched BRANCH's head,
+      # not the tagged commit — so the commit under test is resolved from the checked-out ref and
+      # passed to the gates explicitly. Gating the wrong commit is worse than not gating.
+      - name: Resolve the commit being released
+        id: resolve
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "::notice::releasing ${TAG} at ${sha}"
+
+      - name: "Gate 1: the tagged commit passed CI"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ steps.resolve.outputs.sha }}
+        run: sh scripts/release-ci-gate.sh
+
+      - name: "Gate 2: the tag names the version this tree builds"
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: sh scripts/release-version-gate.sh "$TAG"
+
+      - name: "Gate 3: engine/ pins a released engine of the same minor"
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: sh scripts/release-engine-pin-gate.sh "$TAG"
+
+  # ---------------------------------------------------------------------------
+  # 1. Both images, per architecture — pushed by digest, verified, scanned (gate 4).
+  # ---------------------------------------------------------------------------
+  image-build:
+    name: ${{ matrix.image }} (${{ matrix.platform }})
+    needs: tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The amd64 legs start WARM: trivy.yml builds these exact Dockerfiles and contexts at the
+          # default profile on every push to main, and a cache written on the default branch is
+          # readable from a tag ref. The arm64 legs are cold, deliberately — nothing on main builds
+          # arm64, and a daily arm64 build existing only to warm this rare job costs more than it
+          # saves. Native arm runners (free on public repositories) keep the cold build to roughly
+          # the amd64 leg's time; no QEMU anywhere.
+          - image: sutra-voice
+            context: .
+            file: ./Dockerfile
+            submodules: recursive
+            platform: linux/amd64
+            runner: ubuntu-latest
+            slug: amd64
+            cache_from: type=gha,scope=trivy-image-sutra-voice
+          - image: sutra-voice
+            context: .
+            file: ./Dockerfile
+            submodules: recursive
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+            cache_from: ""
+          - image: sutra-webrtc-worker
+            context: ./tools/sutra-webrtc-worker
+            file: ./tools/sutra-webrtc-worker/Dockerfile
+            submodules: "false"
+            platform: linux/amd64
+            runner: ubuntu-latest
+            slug: amd64
+            cache_from: type=gha,scope=trivy-image-sutra-webrtc-worker
+          - image: sutra-webrtc-worker
+            context: ./tools/sutra-webrtc-worker
+            file: ./tools/sutra-webrtc-worker/Dockerfile
+            submodules: "false"
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+            cache_from: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    env:
+      IMAGE_NAME: ghcr.io/startr-trade/${{ matrix.image }}
+    steps:
+      # The voice engine's build context needs `engine/rust` beside `rust/`; the worker needs no
+      # engine. The submodule is fetched from GitHub, so a pin that is not there fails here too.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          submodules: ${{ matrix.submodules }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build ONE platform and push BY DIGEST — no tag. Tagging happens once, in the merge job,
+      # because a tag can only point at one thing: if each leg pushed the same tag the second would
+      # overwrite the first.
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platform }}
+          # org.opencontainers.image.source links the package to this repository on ghcr.io. It
+          # does NOT make it public: a package first pushed by a workflow starts PRIVATE, a one-time
+          # flip in the package settings (until then `docker pull` answers `unauthorized`).
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.tag.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.tag.outputs.tag }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          provenance: true
+          # The SBOM is produced on the MERGED manifest and cosign-attested there, so buildkit's
+          # own SBOM attestation stays off — two competing SBOM predicates on one image is worse
+          # than one.
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # Read only: a cache written on a tag ref is readable by that ref alone.
+          cache-from: ${{ matrix.cache_from }}
+
+      # ---- VERIFY BEFORE IT BECOMES PULLABLE ---------------------------------------
+      # The digest is pushed but UNTAGGED; nobody pulls it until the merge job tags the manifest
+      # list. If a check below fails, this leg fails, the merge never runs and nothing is tagged.
+      # The checks run on the PUSHED bytes, pulled back exactly as a consumer would get them.
+      - name: Pull back the pushed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker pull "${IMAGE_NAME}@${DIGEST}"
+
+      # The entrypoint EXECUTES on this architecture. The voice engine is a server with no
+      # --version, so the signal is its documented refusal: with no deployments directory it exits
+      # non-zero saying "configuration invalid — refusing to start". A wrong-architecture binary, a
+      # broken ENTRYPOINT or a missing shared library never reaches that message.
+      - name: The voice engine runs on this architecture
+        if: matrix.image == 'sutra-voice'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          img="${IMAGE_NAME}@${DIGEST}"
+          out=''
+          code=0
+          out="$(docker run --rm "$img" 2>&1)" || code=$?
+          printf '%s\n' "$out" | tail -2
+          if [ "$code" = 0 ]; then
+            echo "::error::the engine exited 0 with no configuration — it must refuse to start" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q 'refusing to start'; then
+            echo "::error::the engine did not refuse with the documented configuration error; it may not have run at all" >&2
+            exit 1
+          fi
+          # --health-check is what the image's HEALTHCHECK invokes; with no server up it must fail.
+          if docker run --rm "$img" --health-check >/dev/null 2>&1; then
+            echo "::error::--health-check reported success with no engine running" >&2
+            exit 1
+          fi
+          echo "voice engine runs on ${{ matrix.platform }}, refuses without config, health-check fails closed"
+
+      # Both binaries of the worker image execute here, and each refuses to start without its
+      # configuration in the documented words.
+      - name: The worker and the participant run on this architecture
+        if: matrix.image == 'sutra-webrtc-worker'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          img="${IMAGE_NAME}@${DIGEST}"
+          check() {
+            want="$1"; shift
+            out=''
+            code=0
+            out="$(docker run --rm "$@" 2>&1)" || code=$?
+            printf '%s\n' "$out" | tail -1
+            if [ "$code" = 0 ]; then
+              echo "::error::'$*' exited 0 with no configuration — it must refuse to start" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$out" | grep -q -- "$want"; then
+              echo "::error::'$*' did not refuse with '${want}'; it may not have run at all" >&2
+              exit 1
+            fi
+          }
+          check 'SUTRA_WORKER_ROOM is required' "$img"
+          check '--identity is required' --entrypoint /usr/local/bin/sutra-webrtc-participant "$img"
+          echo "worker and participant run on ${{ matrix.platform }} and refuse without configuration"
+
+      # GATE 4. Scanned before the tag exists, failing on any finding the triage record does not
+      # already account for — the engine's severity policy and .trivyignore.yaml handling.
+      # `make scan-image` / `make worker-scan` is this same gate locally.
+      - name: "Gate 4: scan this platform's image before it is tagged"
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+          trivyignores: .trivyignore.yaml
+
+      # One file per platform, named by the digest itself, so the legs cannot collide.
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          mkdir -p /tmp/digests
+          # Bare hex: a colon is an illegal character in an artifact path.
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 2. Fuse each image's legs into ONE manifest list, then sign and SBOM THAT — the digest
+  #    `docker pull ghcr.io/startr-trade/<image>:<version>` resolves to.
+  # ---------------------------------------------------------------------------
+  image:
+    name: ${{ matrix.image }} (manifest list)
+    # Every leg of BOTH images must have passed: one image is never published without the other.
+    needs: [tag, image-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sutra-voice, sutra-webrtc-worker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless (Sigstore OIDC)
+    env:
+      IMAGE_NAME: ghcr.io/startr-trade/${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download the digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolved explicitly rather than with metadata-action's `type=semver`, which reads
+      # github.ref: on a workflow_dispatch re-release the ref is a BRANCH.
+      - name: Resolve release tag
+        id: rel
+        env:
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          set -eu
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # A tag containing '-' is a pre-release (v1.0.0-rc.1) and must NOT move `latest`.
+          case "$TAG" in
+            *-*) echo "latest=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "latest=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Create the manifest list
+        id: merge
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          LATEST: ${{ steps.rel.outputs.latest }}
+        run: |
+          set -eu
+          tags="--tag ${IMAGE_NAME}:${VERSION}"
+          # Not an `&&` one-liner: under `set -e` a false test would kill the step, and a
+          # pre-release would fail precisely because it correctly declined to move `latest`.
+          if [ "$LATEST" = "true" ]; then
+            tags="$tags --tag ${IMAGE_NAME}:latest"
+          fi
+          # Each digest file names the manifest one architecture leg pushed. Word-splitting is the
+          # point here.
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create $tags \
+            $(printf "${IMAGE_NAME}@sha256:%s " $(ls /tmp/digests))
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "manifest ${IMAGE_NAME}:${VERSION} -> ${digest}"
+
+      # A full version, deliberately: sigstore publishes no floating `v4`.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless (Sigstore / Fulcio): the signing identity IS this workflow's OIDC identity — no
+      # long-lived key material anywhere. Signs the MANIFEST LIST digest.
+      - name: Sign the image (cosign keyless)
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ matrix.image }}.sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest the SBOM to the image digest
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: |
+          cosign attest --yes \
+            --predicate "${{ matrix.image }}.sbom.spdx.json" \
+            --type spdxjson \
+            "${IMAGE_NAME}@${DIGEST}"
+
+      # ---- VERIFY WHAT WAS PUBLISHED -----------------------------------------------
+      # A signature nobody verifies is a ritual. Checked the way a consumer would: keyless, against
+      # the identity allowed to sign this repository's images.
+      - name: The signature verifies, as a consumer would check it
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: |
+          set -eu
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\\.github/workflows/release\\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE_NAME}@${DIGEST}" > /dev/null
+          echo "signature verifies for ${IMAGE_NAME}@${DIGEST}"
+
+      # The manifest list lists BOTH architectures, and every platform image names the commit
+      # being released. The labels are read from the whole per-platform image map, so a merge that
+      # produced a single-arch index, or an image built from another commit, fails here.
+      - name: The manifest lists both architectures and names this release
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+          SHA: ${{ needs.tag.outputs.sha }}
+        run: |
+          set -eu
+          platforms="$(docker buildx imagetools inspect "${IMAGE_NAME}@${DIGEST}" \
+            --format '{{range .Manifest.Manifests}}{{if .Platform}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}{{end}}')"
+          echo "platforms: ${platforms}"
+          for want in linux/amd64 linux/arm64; do
+            case " ${platforms} " in
+              *" ${want} "*) ;;
+              *) echo "::error::the manifest list is missing ${want}" >&2; exit 1 ;;
+            esac
+          done
+          revisions="$(docker buildx imagetools inspect "${IMAGE_NAME}@${DIGEST}" --format '{{json .Image}}' \
+            | jq -r '[.. | objects | .Labels? // empty | ."org.opencontainers.image.revision" // empty] | unique | .[]')"
+          echo "revision labels: ${revisions:-<none>}"
+          if [ "$revisions" != "$SHA" ]; then
+            echo "::error::the images' revision labels are '${revisions}', not this commit ${SHA}" >&2
+            exit 1
+          fi
+
+      - name: Upload SBOM for the Release job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.image }}
+          path: ${{ matrix.image }}.sbom.spdx.json
+          if-no-files-found: error
+
+      - name: Job summary
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          {
+            echo "### ${{ matrix.image }}"
+            echo ""
+            echo "- \`${IMAGE_NAME}:${VERSION}\`"
+            echo "- digest \`${DIGEST}\`"
+            echo "- platforms: linux/amd64 + linux/arm64, each built natively (no emulation)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 3. GitHub Release — the authored notes, both SBOMs and their SHA256SUMS.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: [tag, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the release / upload assets
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download the SBOMs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sbom-*
+          merge-multiple: true
+          path: dist
+
+      # Bare filenames, so `sha256sum -c SHA256SUMS` works from the download directory.
+      - name: Compute SHA256SUMS
+        working-directory: dist
+        run: |
+          set -eu
+          rm -f SHA256SUMS
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
+
+      - name: Create / update the Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          set -eu
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          # Authored notes win: .github/releases/<tag>.md, if present, is the release body;
+          # otherwise GitHub's commit-generated notes.
+          notes="--generate-notes"
+          if [ -f ".github/releases/$TAG.md" ]; then
+            notes="--notes-file .github/releases/$TAG.md"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Already released: re-push the authored body, so a correction to the notes file
+            # reaches the published page. Generated notes are never re-pushed over a hand edit.
+            if [ -f ".github/releases/$TAG.md" ]; then
+              gh release edit "$TAG" --notes-file ".github/releases/$TAG.md"
+            fi
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" \
+              --title "$TAG" \
+              $notes \
+              --verify-tag \
+              $prerelease
+          fi
+          gh release upload "$TAG" dist/* --clobber

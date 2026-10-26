@@ -1,0 +1,120 @@
+name: Trivy
+
+# The same two scans as the engine repository's trivy.yml, with the same severity policy and the
+# same triage record (.trivyignore.yaml), over this repository's tree and its two images. Locally:
+# `make scan-deps`, `make scan-image`, `make worker-scan` (scripts/security-scan.sh).
+#
+# These jobs REPORT (SARIF to the Security tab), like the engine's. The hard gate is in
+# release.yml: each image is scanned there before its tag exists, failing on any finding.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "51 4 * * 1" # weekly, Monday 04:51 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast: the repo tree — vulnerable dependencies (both Cargo.lock files), leaked secrets, IaC
+  # misconfiguration. No submodule checkout, deliberately: `make scan-deps` scans a checkout copy
+  # without `engine/` too, because the engine tree is scanned by the engine's own workflow against
+  # its own triage. The engine crates' dependencies are still covered — they are in rust/Cargo.lock.
+  fs:
+    name: filesystem (deps · secrets · IaC)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs.sarif
+          # EVERY severity is reported. A defect has no level: either the tree is clean or it is
+          # not. The only sanctioned suppression is "no fix available", recorded with its
+          # justification (and an expiry date) in .trivyignore.yaml.
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          # Passed EXPLICITLY: the action only adds --ignorefile when this input is set.
+          trivyignores: .trivyignore.yaml
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # Expensive: build each image and scan its OS packages and bundled binaries. Only on main and the
+  # weekly schedule. The GHA layer cache each leg writes here (on the default branch) is what
+  # release.yml's amd64 legs read back, since a cache written on a tag ref is readable by no other
+  # ref.
+  image:
+    name: image (${{ matrix.name }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The voice engine: context is the repo root, because the build needs `rust/` and the
+          # `engine/` submodule side by side.
+          - name: sutra-voice
+            context: .
+            file: ./Dockerfile
+            submodules: recursive
+          # The WebRTC worker: its own workspace and Dockerfile; no engine.
+          - name: sutra-webrtc-worker
+            context: ./tools/sutra-webrtc-worker
+            file: ./tools/sutra-webrtc-worker/Dockerfile
+            submodules: "false"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          submodules: ${{ matrix.submodules }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          tags: ${{ matrix.name }}:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=trivy-image-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=trivy-image-${{ matrix.name }}
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.name }}:ci
+          format: sarif
+          output: trivy-image.sarif
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          trivyignores: .trivyignore.yaml
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-${{ matrix.name }}
+
+# SEVERITY POLICY (the engine's). Both scans report EVERY severity. The one sanctioned suppression
+# is "upstream has no fix", and every such entry lives in .trivyignore.yaml with the reason
+# written next to it AND an expiry date. When an entry expires the finding returns and must be
+# re-triaged.
+#
+# Reproduce a run locally with:
+#   make scan-deps
+#   make image && make scan-image
+#   make worker-image && make worker-scan

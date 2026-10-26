@@ -1,0 +1,53 @@
+name: CodeQL
+
+# CodeQL for Rust over this repository, the same run as the engine repository's codeql.yml and as
+# `make codeql` locally (scripts/security-scan.sh), which share scripts/codeql-config.yml.
+#
+# No submodule checkout, deliberately: `make codeql` analyses a checkout copy WITHOUT the
+# `engine/` submodule, because the engine is analysed by the engine repository's own workflow,
+# against its own triage. Checking it out here would report the engine's code as this
+# repository's alerts, and the local and GitHub runs would no longer analyse the same code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "37 3 * * 1" # weekly, Monday 03:37 UTC
+
+jobs:
+  analyze:
+    name: Analyze (Rust)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Shared with `make codeql`, so the local gate and this run analyze the same code.
+          config-file: ./scripts/codeql-config.yml
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"
+
+# NOTES
+# - CodeQL code scanning is free on public repositories.
+# - `build-mode: none` extracts from source. The WebRTC worker (tools/sutra-webrtc-worker) is
+#   Rust in the same tree and is analysed with the rest.

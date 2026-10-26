@@ -75,6 +75,27 @@ reaps leaked ones. The default target dir is `rust/target`; on a disk-constraine
 shared `CARGO_TARGET_DIR` with the engine checkout is safe (path dependencies from different
 trees get different package ids, so only third-party artifacts are shared).
 
+## Releasing
+
+A `v*` tag runs `.github/workflows/release.yml`, which publishes exactly two images,
+`ghcr.io/startr-trade/sutra-voice` and `ghcr.io/startr-trade/sutra-webrtc-worker` (multi-arch,
+cosign-signed, provenance + SBOM, the engine's setup), and a GitHub Release whose body is
+`.github/releases/v<version>.md`. No CLI, no crates. Four gates run first, and a failure publishes
+nothing:
+
+1. `scripts/release-ci-gate.sh` — `ci.yml` succeeded on the tagged commit;
+2. `scripts/release-version-gate.sh v<x.y.z>` — both `[workspace.package]` versions equal the tag;
+3. `scripts/release-engine-pin-gate.sh v<x.y.z>` — the `engine/` gitlink is exactly a `v*` tag of
+   `github.com/startr-trade/sutra` (final for a final release) with the same `MAJOR.MINOR`
+   (`SUTRA_ENGINE_REMOTE=<path>` points it at a local clone for testing);
+4. Trivy over each per-architecture image before it is tagged (`.trivyignore.yaml`, every severity).
+
+Versions are aligned by minor, own patch: voice 0.6.x on engine 0.6.x. So a release is: engine tag
+exists → pin bump to it → bump both workspace versions + CHANGELOG + `.github/releases/` → CI
+green → tag. Third-party actions are pinned by commit SHA (`scripts/verify-workflow-actions.sh`
+checks they resolve); lint the workflows with actionlint. The book deploys to
+voice.sutra.startr.trade from `docs.yml` on every push to `main` that touches `docs/`.
+
 ## Where to read next
 
 | Question | Page |

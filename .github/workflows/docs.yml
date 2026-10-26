@@ -1,0 +1,99 @@
+name: Docs
+
+# Builds the mdBook under docs/ and publishes it to GitHub Pages at voice.sutra.startr.trade, the
+# way the engine repository publishes its book. docs/src/CNAME carries the domain; mdBook copies it
+# into the built site, which is what keeps the custom domain across deploys.
+#
+# Diagrams are ```mermaid fences drawn in the reader's browser by the committed Pele build
+# (docs/pele.global.js), so there is no preprocessor to install — but the build is only correct if
+# that file is the pinned one, which `scripts/docs-pele.sh --check` verifies first.
+#
+# One-time repo setup before the first successful deploy:
+#   Settings → Pages → Build and deployment → Source = "GitHub Actions",
+#   and Settings → Pages → Custom domain = voice.sutra.startr.trade (with its DNS CNAME record).
+# Without the first, actions/deploy-pages fails with "Pages site not found".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "scripts/docs-pele.sh"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "scripts/docs-pele.sh"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only one Pages deployment at a time; do not cancel an in-flight deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Pinned so a book that builds locally builds identically here (the engine book's mdBook).
+  MDBOOK_VERSION: "0.5.4"
+
+jobs:
+  build:
+    name: mdBook build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: The committed Pele build is the pinned one
+        run: scripts/docs-pele.sh --check
+
+      - name: Install mdBook
+        run: |
+          set -eu
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: mdbook build docs
+
+      - name: The site carries its custom domain
+        run: |
+          set -eu
+          test "$(cat docs/book/CNAME)" = "voice.sutra.startr.trade" \
+            || { echo "::error::docs/book/CNAME is missing or wrong — the deploy would drop the custom domain" >&2; exit 1; }
+
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      # `build-dir` defaults to `book` relative to book.toml → docs/book.
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    # PRs build the book (a broken book fails the PR) but never deploy.
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

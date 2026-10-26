@@ -28,6 +28,17 @@ Voice, meeting and video support is a **preview** in this release.
 > preview: the channel keys, the media protocol, the `voip://` operations and the recording
 > format may still change in a minor release.
 
+### Added — the release mechanism
+
+- **`release.yml`** on a `v*` tag publishes `ghcr.io/startr-trade/sutra-voice` and
+  `ghcr.io/startr-trade/sutra-webrtc-worker` (linux/amd64 + linux/arm64, built natively,
+  cosign-signed, provenance, SPDX SBOM) and a GitHub Release from `.github/releases/v<version>.md`,
+  behind four gates: CI passed on the commit, both workspace versions match the tag, `engine/` pins
+  exactly a released engine tag of the same minor, and Trivy is clean on each image before it is
+  tagged. Plus `trivy.yml`, `codeql.yml`, `nightly.yml` (tier 2 and the worker) and `docs.yml`
+  (the book to voice.sutra.startr.trade); CI also checks the book and the worker's lockfile. The
+  worker image builds for arm64 as well as amd64.
+
 ### Changed — meeting analysis moves into the flows; the engine's object store and audit journal (PREVIEW)
 
 - **The transport no longer analyses meetings.** The `call-analysis` channel and its `analyze.*`
