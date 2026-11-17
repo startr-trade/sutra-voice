@@ -8,7 +8,11 @@ name: CI
 #   make lint      → cargo clippy --workspace --all-targets -- -D warnings
 #   make test      → cargo test --workspace                      (tier-1, no Docker)
 #   make audit     → cargo audit + cargo deny check   (rust/deny.toml, rust/.cargo/audit.toml)
-#                    + the same two over the WebRTC worker's own lockfile
+#   make worker-audit → the same two over the WebRTC worker's own lockfile
+#   make scan-deps → Trivy over the tree: lockfiles, secrets, IaC (no build)
+#   make actionlint → actionlint over every workflow
+#
+# `make ci` runs them all locally, cheapest first.
 #
 # The book is built and checked by docs.yml, on every change under docs/, as in the engine
 # repository; this gate is code only.
@@ -22,8 +26,9 @@ name: CI
 #
 # No Docker jobs: the tier-2 voice suites (`make test-docker`) run a PBX or an SFU, SIPp or the
 # WebRTC participant, the stub model and an object store per suite, and the WebRTC worker builds
-# against libwebrtc in its own Docker toolchain. Both run nightly (nightly.yml); the images are
-# built and scanned by trivy.yml and, for a release, by release.yml.
+# against libwebrtc in its own Docker toolchain. Both run nightly (nightly.yml). No job here builds
+# an image: a commit is not a release. release.yml builds each image once, for the tag that ships
+# it, and scans it before the tag exists; trivy.yml re-scans the published images weekly.
 #
 # Third-party actions are pinned by commit SHA, with the version they resolved to in a comment.
 
@@ -50,6 +55,18 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  actionlint:
+    name: actionlint (make actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      # The engine repository's pinned image: every workflow, shell scripts included.
+      - name: actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -137,6 +154,17 @@ jobs:
       # The worker is its own workspace with its own lockfile (and its own deny.toml), and it ships
       # as its own image. cargo-deny and cargo-audit read only the lockfile and the manifests, so
       # this needs neither Docker nor libwebrtc — the host half of `make worker-lint`.
-      - name: worker supply chain (cargo deny + cargo audit)
-        working-directory: tools/sutra-webrtc-worker
-        run: cargo deny check && cargo audit
+      - name: worker supply chain (make worker-audit)
+        run: make worker-audit
+
+  # Trivy over the tree (both lockfiles, secrets, Dockerfile and OpenTofu misconfiguration), as
+  # `make scan-deps` does locally: the same script, Trivy in Docker, the same triage record. It
+  # reads the tree only; the engine/ submodule is scanned by the engine's own CI.
+  scan-deps:
+    name: dependency, secret and IaC scan (make scan-deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: make scan-deps
+        run: make scan-deps

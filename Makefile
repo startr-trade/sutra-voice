@@ -33,7 +33,7 @@ IMAGE ?= sutra-voice-engine:dev
 # far-end containers; 2 keeps their real-time audio paths unstarved on a dev box.
 TEST_THREADS ?= 2
 
-.PHONY: help submodule build test test-docker lint fmt fmt-check audit scan-deps image \
+.PHONY: help ci actionlint submodule build test test-docker lint fmt fmt-check audit worker-audit scan-deps image \
         image-release scan-image codeql docker-clean \
         worker-image worker-toolchain worker-lint worker-test worker-scan
 
@@ -75,6 +75,25 @@ fmt-check: ## rustfmt in check mode (CI gate).
 audit: ## Supply-chain gate: cargo-audit + cargo-deny (licenses/bans/sources/advisories).
 	cd rust && cargo audit
 	cd rust && cargo deny check
+
+worker-audit: ## The same supply-chain gate over the WebRTC worker's own lockfile and deny.toml.
+	cd tools/sutra-webrtc-worker && cargo deny check && cargo audit
+
+## The image and digest ci.yml's actionlint job uses, so the local check is the same check.
+ACTIONLINT_IMAGE := rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+actionlint: ## Lint the GitHub workflows (shellcheck included), as ci.yml does; needs Docker.
+	docker run --rm -v "$$PWD:/repo" -w /repo $(ACTIONLINT_IMAGE) -color
+
+## The local CI gate: ci.yml's jobs, cheapest first, stopping at the first failure. Run it before
+## every push. Tier-2 and the image scans are not in it: they run nightly and per release.
+ci: ## Local CI, the jobs of ci.yml: actionlint, fmt-check, lint, test, audit, worker-audit, scan-deps.
+	$(MAKE) --no-print-directory actionlint
+	$(MAKE) --no-print-directory fmt-check
+	$(MAKE) --no-print-directory lint
+	$(MAKE) --no-print-directory test
+	$(MAKE) --no-print-directory audit
+	$(MAKE) --no-print-directory worker-audit
+	$(MAKE) --no-print-directory scan-deps
 
 ## Security scans, the same scanners the engine runs (scripts/security-scan.sh). Each FAILS on
 ## any finding; a finding with no reachable fix goes in .trivyignore.yaml, time-boxed.
